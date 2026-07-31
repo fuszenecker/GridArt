@@ -64,8 +64,20 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
             "Grid {Columns}x{Rows} = {Cells} cells; output {OutWidth}x{OutHeight}.",
             columns, rows, columns * rows, outputSize.Width, outputSize.Height);
 
+        if (options.ClearCache)
+        {
+            var removed = TileCache.Clear(options.CacheDirectory, logger);
+            logger.LogInformation("Cleared {Count} cache file(s).", removed);
+        }
+
+        // Keyed on the tiles folder and TileSize only — the two things the cached pixels depend on.
+        var cache = options.NoCache
+            ? null
+            : TileCache.Open(options.CacheDirectory, options.TilesFolder, options.TileSize, logger);
+
         using var library = await TileLibrary.LoadAsync(
-            options.TilesFolder, cellSize, options.SignatureGrid, options.Recursive, logger, cancellationToken);
+            options.TilesFolder, cellSize, options.SignatureGrid, options.Recursive, logger,
+            cancellationToken, cache);
 
         if (options.MaxTileReuse > 0)
         {

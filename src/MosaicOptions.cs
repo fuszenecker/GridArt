@@ -70,6 +70,20 @@ public sealed class MosaicOptions
     /// <summary>Whether <see cref="TilesFolder"/> is searched recursively.</summary>
     public bool Recursive { get; set; } = true;
 
+    /// <summary>
+    /// Disables the on-disk cache of decoded, cell-sized tiles. The cache is keyed on file identity
+    /// and <see cref="TileSize"/> only, so it is safe to leave on while other options change.
+    /// </summary>
+    public bool NoCache { get; set; }
+
+    /// <summary>
+    /// Where cache files live. Defaults to <c>%LOCALAPPDATA%/GridArt/cache</c>.
+    /// </summary>
+    public string? CacheDirectory { get; set; }
+
+    /// <summary>Deletes all cache files before running.</summary>
+    public bool ClearCache { get; set; }
+
     /// <summary>Overwrite <see cref="OutputPath"/> if it already exists.</summary>
     public bool Overwrite { get; set; }
 

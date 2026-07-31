@@ -23,7 +23,14 @@ public static class CommandLine
           -d, --repeat-distance <n>      Cells to keep between repeats (default 2)
               --recursive <bool>         Scan subfolders (default true)
           -f, --overwrite                Replace an existing output file
+              --no-cache                 Skip the decoded-tile cache for this run
+              --cache-dir <path>         Cache location (default: %LOCALAPPDATA%\GridArt\cache)
+              --clear-cache              Delete all cache files before running
           -h, --help                     Show this help
+
+        Decoded, cell-sized tiles are cached on disk and reused when a source file's size and
+        timestamp are unchanged. The cache is keyed on the tiles folder and --tile-size only, so
+        changing any other option still hits the cache.
 
         Every option is also settable as configuration, which is how appsettings.json and
         environment variables reach it:
@@ -44,7 +51,8 @@ public static class CommandLine
     /// Flags that take no value. The configuration binder needs <c>key=true</c>, so a bare
     /// <c>--overwrite</c> is expanded before parsing.
     /// </summary>
-    private static readonly string[] BooleanFlags = ["-f", "--overwrite"];
+    private static readonly string[] BooleanFlags =
+        ["-f", "--overwrite", "--no-cache", "--clear-cache"];
 
     private static Dictionary<string, string> BuildSwitchMappings()
     {
@@ -71,6 +79,9 @@ public static class CommandLine
         Map(nameof(MosaicOptions.RepeatAvoidanceRadius), "-d", "--repeat-distance");
         Map(nameof(MosaicOptions.Recursive), "", "--recursive");
         Map(nameof(MosaicOptions.Overwrite), "-f", "--overwrite");
+        Map(nameof(MosaicOptions.NoCache), "", "--no-cache");
+        Map(nameof(MosaicOptions.CacheDirectory), "", "--cache-dir");
+        Map(nameof(MosaicOptions.ClearCache), "", "--clear-cache");
 
         return mappings;
     }

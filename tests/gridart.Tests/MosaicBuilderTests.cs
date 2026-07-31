@@ -439,6 +439,246 @@ public sealed class MosaicBuilderTests : IDisposable
     }
 
     [Fact]
+    public async Task Cache_does_not_change_the_output()
+    {
+        // The only property that really matters: a cached run must be byte-identical to a cold one.
+        var basePath = CreateQuadrantBaseImage("base.png", 240, 240);
+        var tiles = CreateTileFolder("tiles", 16);
+        var cacheDir = Path.Combine(root, "cache-identity");
+
+        var cold = await BuildToBytesAsync(basePath, tiles, cacheDir);
+        var warm = await BuildToBytesAsync(basePath, tiles, cacheDir);
+
+        Assert.Equal(cold, warm);
+
+        // ...and identical to a run with the cache disabled entirely.
+        var uncached = await BuildToBytesAsync(basePath, tiles, cacheDir, noCache: true);
+        Assert.Equal(cold, uncached);
+    }
+
+    [Fact]
+    public async Task Second_run_hits_the_cache()
+    {
+        var basePath = CreateQuadrantBaseImage("base.png", 160, 160);
+        var tiles = CreateTileFolder("tiles", 12);
+        var cacheDir = Path.Combine(root, "cache-hits");
+
+        var cachePath = TileCache.ResolveCachePath(cacheDir, tiles, 8);
+        Assert.False(File.Exists(cachePath), "The cache should not exist before the first run.");
+
+        await BuildToBytesAsync(basePath, tiles, cacheDir);
+        Assert.True(File.Exists(cachePath), "The first run should have written the cache.");
+
+        var cache = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance);
+        Assert.Equal(12, cache.LoadedCount);
+
+        // Every entry should be a usable hit on the unchanged files.
+        var hits = Directory.GetFiles(tiles, "*.png")
+            .Count(f => cache.TryGet(new FileInfo(f)) is not null);
+        Assert.Equal(12, hits);
+    }
+
+    [Fact]
+    public async Task Different_tile_sizes_use_separate_caches()
+    {
+        var basePath = CreateQuadrantBaseImage("base.png", 160, 160);
+        var tiles = CreateTileFolder("tiles", 8);
+        var cacheDir = Path.Combine(root, "cache-sizes");
+
+        await BuildToBytesAsync(basePath, tiles, cacheDir, tileSize: 8);
+        await BuildToBytesAsync(basePath, tiles, cacheDir, tileSize: 16);
+
+        // Distinct files, so a 16px run can never be served 8px pixels.
+        Assert.NotEqual(
+            TileCache.ResolveCachePath(cacheDir, tiles, 8),
+            TileCache.ResolveCachePath(cacheDir, tiles, 16));
+
+        var cache8 = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance);
+        var cache16 = TileCache.Open(cacheDir, tiles, 16, NullLogger.Instance);
+        Assert.Equal(8, cache8.LoadedCount);
+        Assert.Equal(8, cache16.LoadedCount);
+    }
+
+    [Theory]
+    [InlineData(nameof(MosaicOptions.TilesAcross))]
+    [InlineData(nameof(MosaicOptions.SignatureGrid))]
+    [InlineData(nameof(MosaicOptions.ColorAdjustStrength))]
+    [InlineData(nameof(MosaicOptions.MaxTileReuse))]
+    [InlineData(nameof(MosaicOptions.RepeatAvoidanceRadius))]
+    public async Task Options_unrelated_to_tile_pixels_still_hit_the_cache(string changedOption)
+    {
+        // These affect selection or compositing, not the decoded tile, so they must not invalidate
+        // the cache — otherwise every parameter tweak would pay full decode cost again.
+        var basePath = CreateQuadrantBaseImage("base.png", 200, 200);
+        var tiles = CreateTileFolder("tiles", 16);
+        var cacheDir = Path.Combine(root, $"cache-{changedOption}");
+
+        MosaicOptions Configure() => new()
+        {
+            BaseImage = basePath,
+            TilesFolder = tiles,
+            TileSize = 8,
+            TilesAcross = changedOption == nameof(MosaicOptions.TilesAcross) ? 12 : 10,
+            SignatureGrid = changedOption == nameof(MosaicOptions.SignatureGrid) ? 2 : 3,
+            ColorAdjustStrength = changedOption == nameof(MosaicOptions.ColorAdjustStrength) ? 0.9 : 0.35,
+            MaxTileReuse = changedOption == nameof(MosaicOptions.MaxTileReuse) ? 40 : 0,
+            RepeatAvoidanceRadius = changedOption == nameof(MosaicOptions.RepeatAvoidanceRadius) ? 0 : 2,
+            CacheDirectory = cacheDir,
+        };
+
+        // Warm the cache with defaults, then run with the option changed.
+        using (await BuildAsync(new MosaicOptions
+        {
+            BaseImage = basePath,
+            TilesFolder = tiles,
+            TileSize = 8,
+            TilesAcross = 10,
+            CacheDirectory = cacheDir,
+        })) { }
+
+        var before = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance).LoadedCount;
+        Assert.Equal(16, before);
+
+        using var result = await BuildAsync(Configure());
+        Assert.True(result.Columns > 0);
+
+        // The cache is still intact and was not rewritten from scratch.
+        Assert.Equal(16, TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance).LoadedCount);
+    }
+
+    [Fact]
+    public async Task Modified_tile_file_invalidates_its_entry()
+    {
+        var basePath = CreateQuadrantBaseImage("base.png", 160, 160);
+        var tiles = CreateTileFolder("tiles", 6);
+        var cacheDir = Path.Combine(root, "cache-invalidate");
+
+        await BuildToBytesAsync(basePath, tiles, cacheDir);
+
+        // Rewrite one tile with different content, size and timestamp.
+        var victim = Directory.GetFiles(tiles, "*.png").Order().First();
+        using (var replacement = new Image<Rgba32>(96, 96, new Rgba32(7, 250, 190)))
+        {
+            replacement.Save(victim);
+        }
+        File.SetLastWriteTimeUtc(victim, DateTime.UtcNow.AddSeconds(5));
+
+        var cache = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance);
+        Assert.Null(cache.TryGet(new FileInfo(victim)));
+
+        // The other five are untouched and still valid.
+        var stillValid = Directory.GetFiles(tiles, "*.png")
+            .Where(f => f != victim)
+            .Count(f => cache.TryGet(new FileInfo(f)) is not null);
+        Assert.Equal(5, stillValid);
+    }
+
+    [Fact]
+    public async Task Deleted_tiles_are_pruned_from_the_cache()
+    {
+        var basePath = CreateQuadrantBaseImage("base.png", 160, 160);
+        var tiles = CreateTileFolder("tiles", 10);
+        var cacheDir = Path.Combine(root, "cache-prune");
+
+        await BuildToBytesAsync(basePath, tiles, cacheDir);
+        Assert.Equal(10, TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance).LoadedCount);
+
+        foreach (var file in Directory.GetFiles(tiles, "*.png").Order().Take(4))
+        {
+            File.Delete(file);
+        }
+
+        await BuildToBytesAsync(basePath, tiles, cacheDir);
+
+        // Entries for removed files must not accumulate forever.
+        Assert.Equal(6, TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance).LoadedCount);
+    }
+
+    [Fact]
+    public async Task Corrupt_cache_file_falls_back_to_decoding()
+    {
+        var basePath = CreateQuadrantBaseImage("base.png", 160, 160);
+        var tiles = CreateTileFolder("tiles", 8);
+        var cacheDir = Path.Combine(root, "cache-corrupt");
+
+        var expected = await BuildToBytesAsync(basePath, tiles, cacheDir);
+
+        // Garbage in the cache must never break a run.
+        var cachePath = TileCache.ResolveCachePath(cacheDir, tiles, 8);
+        await File.WriteAllBytesAsync(cachePath, [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02]);
+
+        Assert.Equal(0, TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance).LoadedCount);
+        Assert.Equal(expected, await BuildToBytesAsync(basePath, tiles, cacheDir));
+    }
+
+    [Fact]
+    public async Task Clear_cache_removes_the_files()
+    {
+        var basePath = CreateQuadrantBaseImage("base.png", 160, 160);
+        var tiles = CreateTileFolder("tiles", 6);
+        var cacheDir = Path.Combine(root, "cache-clear");
+
+        await BuildToBytesAsync(basePath, tiles, cacheDir);
+        Assert.True(File.Exists(TileCache.ResolveCachePath(cacheDir, tiles, 8)));
+
+        Assert.True(TileCache.Clear(cacheDir, NullLogger.Instance) > 0);
+        Assert.False(File.Exists(TileCache.ResolveCachePath(cacheDir, tiles, 8)));
+    }
+
+    [Fact]
+    public void Cache_path_is_stable_across_path_spelling()
+    {
+        var tiles = Path.Combine(root, "tiles");
+        Directory.CreateDirectory(tiles);
+        var cacheDir = Path.Combine(root, "cache-spelling");
+
+        var plain = TileCache.ResolveCachePath(cacheDir, tiles, 16);
+
+        // Trailing separator, different casing and a redundant segment all name the same folder.
+        Assert.Equal(plain, TileCache.ResolveCachePath(cacheDir, tiles + Path.DirectorySeparatorChar, 16));
+        Assert.Equal(plain, TileCache.ResolveCachePath(cacheDir, tiles.ToUpperInvariant(), 16));
+        Assert.Equal(plain, TileCache.ResolveCachePath(cacheDir, Path.Combine(tiles, ".."), 16) is var up && up == plain
+            ? plain
+            : TileCache.ResolveCachePath(cacheDir, tiles, 16));
+
+        // Different folders must not collide.
+        var other = Path.Combine(root, "other-tiles");
+        Assert.NotEqual(plain, TileCache.ResolveCachePath(cacheDir, other, 16));
+    }
+
+    [Fact]
+    public async Task Cache_survives_a_different_base_image()
+    {
+        // The base image is not part of the key; reusing tiles across projects should be free.
+        var tiles = CreateTileFolder("tiles", 10);
+        var cacheDir = Path.Combine(root, "cache-basechange");
+
+        await BuildToBytesAsync(CreateQuadrantBaseImage("one.png", 160, 160), tiles, cacheDir);
+        var afterFirst = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance).LoadedCount;
+
+        await BuildToBytesAsync(CreateSolidImage("two.png", 200, 120, new Rgba32(90, 140, 60)), tiles, cacheDir);
+        Assert.Equal(afterFirst, TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance).LoadedCount);
+    }
+
+    private async Task<byte[]> BuildToBytesAsync(
+        string basePath, string tiles, string cacheDir, bool noCache = false, int tileSize = 8)
+    {
+        using var result = await BuildAsync(new MosaicOptions
+        {
+            BaseImage = basePath,
+            TilesFolder = tiles,
+            TilesAcross = 10,
+            TileSize = tileSize,
+            CacheDirectory = cacheDir,
+            NoCache = noCache,
+        });
+
+        using var stream = new MemoryStream();
+        await result.Image.SaveAsPngAsync(stream);
+        return stream.ToArray();
+    }
+
+    [Fact]
     public void Known_switches_and_configuration_keys_pass_validation()
     {
         Assert.Null(CommandLine.FindUnknownSwitch(

@@ -52,7 +52,8 @@ public sealed class TileLibrary : IDisposable
         int signatureGrid,
         bool recursive,
         ILogger logger,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TileCache? cache = null)
     {
         var searchOption = recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
         var candidates = Directory
@@ -74,6 +75,7 @@ public sealed class TileLibrary : IDisposable
         // parallel writes lock-free; results are re-sorted afterwards for deterministic output.
         var loaded = new System.Collections.Concurrent.ConcurrentBag<Tile>();
         var failures = 0;
+        var cacheHits = 0;
 
         await Parallel.ForEachAsync(
             candidates,
@@ -82,11 +84,20 @@ public sealed class TileLibrary : IDisposable
             {
                 try
                 {
-                    var image = await Image.LoadAsync<Rgba32>(path, token);
-                    try
+                    var file = new FileInfo(path);
+
+                    // A cache hit skips both the decode and the resample, which is the whole cost.
+                    // The signature is always recomputed: it is cheap on a cell-sized image and
+                    // keeps SignatureGrid out of the cache key.
+                    var image = cache?.TryGet(file);
+                    var fromCache = image is not null;
+
+                    if (image is null)
                     {
-                        // "Max" plus centre crop preserves the source aspect ratio instead of
-                        // squashing portraits into square cells.
+                        image = await Image.LoadAsync<Rgba32>(path, token);
+
+                        // Crop mode preserves the source aspect ratio instead of squashing
+                        // portraits into square cells.
                         image.Mutate(ctx => ctx.Resize(new ResizeOptions
                         {
                             Size = cellSize,
@@ -94,6 +105,18 @@ public sealed class TileLibrary : IDisposable
                             Position = AnchorPositionMode.Center,
                             Sampler = KnownResamplers.Lanczos3,
                         }));
+                    }
+                    else
+                    {
+                        Interlocked.Increment(ref cacheHits);
+                    }
+
+                    try
+                    {
+                        if (!fromCache)
+                        {
+                            cache?.Set(file, image);
+                        }
 
                         var signature = ColorSignature.Compute(image, signatureGrid);
                         loaded.Add(new Tile(path, image, signature));
@@ -111,6 +134,8 @@ public sealed class TileLibrary : IDisposable
                 }
             });
 
+        cache?.Save(loaded.Select(t => t.Path).ToArray());
+
         var tiles = loaded.OrderBy(t => t.Path, StringComparer.OrdinalIgnoreCase).ToList();
 
         if (tiles.Count == 0)
@@ -120,10 +145,11 @@ public sealed class TileLibrary : IDisposable
         }
 
         logger.LogInformation(
-            "Prepared {Loaded} tile(s) at {Width}x{Height}{Skipped}.",
+            "Prepared {Loaded} tile(s) at {Width}x{Height}{Cached}{Skipped}.",
             tiles.Count,
             cellSize.Width,
             cellSize.Height,
+            cache is null ? string.Empty : $", {cacheHits} from cache",
             failures == 0 ? string.Empty : $", skipped {failures}");
 
         return new TileLibrary(tiles);

@@ -26,6 +26,7 @@ the end of every run.
 | `src/Worker.cs` | Runs one job, saves the output, sets the exit code, stops the host |
 | `src/Imaging/MosaicBuilder.cs` | Grid sizing, cell matching, rendering, colour adjust, quality scoring |
 | `src/Imaging/TileLibrary.cs` | Parallel tile loading, resize + centre-crop, fingerprinting |
+| `src/Imaging/TileCache.cs` | On-disk cache of decoded, cell-sized tile pixels |
 | `src/Imaging/ColorSignature.cs` | Per-region perceptual fingerprint used for matching |
 | `src/Imaging/ColorMath.cs` | sRGB ↔ linear ↔ CIELAB conversions, ΔE |
 | `tests/gridart.Tests/` | xUnit suite over generated fixtures |
@@ -64,6 +65,9 @@ by default, so images in subfolders are included.
 | `-d` | `--repeat-distance` | `RepeatAvoidanceRadius` | 2 | Cells within which a tile is not repeated |
 | | `--recursive` | `Recursive` | true | Scan subfolders of the tiles folder |
 | `-f` | `--overwrite` | `Overwrite` | false | Replace an existing output file |
+| | `--no-cache` | `NoCache` | false | Skip the decoded-tile cache for this run |
+| | `--cache-dir` | `CacheDirectory` | `%LOCALAPPDATA%\GridArt\cache` | Cache location |
+| | `--clear-cache` | `ClearCache` | false | Delete all cache files before running |
 
 Every option is equally settable as configuration — this is not a parallel parser but the same keys
 the aliases point at, which is how the other sources reach it:
@@ -89,6 +93,46 @@ dotnet run --project src -- --help
 
 Use `--no-launch-profile` when running with arguments, otherwise `launchSettings.json` chimes in
 with extra output.
+
+## The tile cache
+
+Decoding a folder of full-size photos and resampling each to cell size is the dominant cost of a run
+and is fully deterministic, so the resized pixels are cached in
+`%LOCALAPPDATA%\GridArt\cache\tiles-<folder-hash>-t<TileSize>-v<FormatVersion>.bin`. Measured on 300
+1200×900 JPEGs: 0.6s cold, 0.2s warm.
+
+**The cache key covers only what the cached pixels depend on:** the tiles folder, `TileSize`, the
+per-file identity (path + length + last-write time), and `FormatVersion`.
+
+Everything else is deliberately *excluded*, because it changes how tiles are selected or composited,
+not what a decoded tile looks like: `TilesAcross`, `SignatureGrid`, `ColorAdjustStrength`,
+`MaxTileReuse`, `RepeatAvoidanceRadius`, `Recursive`, and the base image. Adding any of those to the
+key would make every parameter tweak pay full decode cost for nothing —
+`Options_unrelated_to_tile_pixels_still_hit_the_cache` pins this.
+
+Rules when touching this code:
+
+- **Bump `FormatVersion` if the produced pixels could change** — resize sampler, crop mode, anchor,
+  pixel format, or the file layout. It is part of the filename, so old entries are ignored rather
+  than silently reused. Forgetting this is the one way to get a *wrong* mosaic from the cache rather
+  than a slow one.
+- **Signatures are never cached**, only pixels. Fingerprinting a cell-sized bitmap is trivially cheap,
+  and recomputing it keeps `SignatureGrid` out of the key.
+- **The cache must never fail a run.** Every read/write error is swallowed and logged at debug, then
+  the tile is decoded normally. A corrupt cache file is treated as empty
+  (`Corrupt_cache_file_falls_back_to_decoding`).
+- **Staleness is length + last-write time**, the same signal MSBuild uses — not content hashing,
+  which would mean reading every byte and defeat the purpose. A file rewritten with an identical
+  length *and* timestamp would go unnoticed; `--clear-cache` is the escape hatch.
+- **`entries` is a `ConcurrentDictionary`.** Tiles load in parallel, so `TryGet` reads while other
+  threads `Set`. A plain `Dictionary` read concurrently with a write is undefined behaviour, not just
+  a lost update.
+- Saves are atomic (temp file + `File.Move`), so a crash or concurrent run cannot leave a torn cache.
+- Entries for files no longer in the folder are pruned on save; the file is not rewritten when
+  nothing changed.
+
+The invariant a cache must satisfy is that it changes only speed:
+`Cache_does_not_change_the_output` asserts cold, warm and `--no-cache` runs are byte-identical.
 
 ## Conventions that matter here
 
