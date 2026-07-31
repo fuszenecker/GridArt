@@ -65,7 +65,7 @@ by default, so images in subfolders are included.
 | `-g` | `--signature-grid` | `SignatureGrid` | 3 | Match patches per axis; 1 = average colour only, >1 also matches structure |
 | `-c` | `--color-adjust` | `ColorAdjustStrength` | 0.35 | 0 = untouched tiles, 1 = exactly the base image |
 | `-r` | `--max-reuse` | `MaxTileReuse` | 0 (unlimited) | Cap on placements per source image |
-| `-d` | `--repeat-distance` | `RepeatAvoidanceRadius` | 2 | Cells within which a tile is not repeated |
+| `-d` | `--repeat-distance` | `RepeatAvoidanceRadius` | 2 | Cells that must separate two uses of one image — a hard rule, see below |
 | | `--recursive` | `Recursive` | true | Scan subfolders of the tiles folder |
 | `-f` | `--overwrite` | `Overwrite` | false | Replace an existing output file |
 | | `--no-cache` | `NoCache` | false | Skip the decoded-tile cache for this run |
@@ -99,6 +99,60 @@ dotnet run --project src -- --help
 Use `--no-launch-profile` when running with arguments, otherwise `launchSettings.json` chimes in
 with extra output.
 
+## Never change a source image's colours
+
+A tile must reach the output with the colours of the photo it came from. Three separate defects each
+broke that, and all three are fixed — none of them may come back.
+
+- **Every `Resize` sets `Compand = true`.** Without it the resampler averages *gamma-encoded* bytes,
+  which is mathematically the wrong average and makes every downscaled tile darker than its source.
+  Measured over 3,000 real photos resized 32×32: source mean linear luma **0.3118**; with
+  `Compand = true` **0.3119** (delta **+0.0001**, worst tile −0.0025); with `Compand = false`
+  **0.2150** (delta **−0.0968**, worst tile **−0.2805**). As sRGB grey that is 152 → 128 — a visible,
+  uniform darkening of the whole mosaic. Both resizes need it: the tiles in `TileLibrary` *and* the
+  base rescale in `MosaicBuilder.AnalyseBaseAsync`.
+- **`Render` copies pixel rows verbatim; it does not use `DrawImage`.** `DrawImage` blends the tile
+  against the blank canvas, which rewrites the colour channels of a fully transparent source pixel to
+  zero — measured: `Rgba32(200,40,40,0)` in, `Rgba32(0,0,0,0)` out. A `Span.CopyTo` per row is both
+  faithful and faster. Cell rows write disjoint pixel rows, which is what makes it parallel-safe.
+- **`ApplyColorAdjust` preserves the tile's own alpha.** It used to write `byte.MaxValue`, turning a
+  transparent PNG tile into a solid block. Only the colour channels are blended, and only in linear
+  light.
+
+The end-to-end check that pins all of this: with `-c 0`, **all 10,800** 32×32 blocks of a rendered
+3,000-tile mosaic hash byte-identical to a resized source image, 0 altered. If you touch the resize,
+the render or the adjust, re-run that comparison rather than eyeballing the output.
+
+## Repeat distance is a hard constraint
+
+`-d` / `RepeatAvoidanceRadius` means **no two cells within that Chebyshev radius may use the same
+source image.** It is an exclusion from the candidate set, not a term in the score.
+
+It was originally a `RepeatPenalty = 900f` added to a losing candidate's squared-ΔE score, which is a
+*preference*: whenever every alternative scored more than 900 worse, the repeat still won and a tile
+landed next to itself. Measured on a flat grey 20×20 grid with 300 unique tiles, the penalty version
+produced **1,859 violations at `-d 6`** (and 108 at `-d 4` on an aliased fixture); the exclusion
+version produces **0 at `-d 1`, `-d 2`, `-d 4` and `-d 6`**. Do not reintroduce a scoring penalty here.
+
+- **Relaxation is per cell, and it is reported.** A hard ban can be unsatisfiable — a flat base image
+  with fewer tiles than a neighbourhood has cells has no legal move — so when nothing is admissible the
+  radius shrinks one ring at a time *for that cell only*, and `BuildAsync` logs a warning naming the
+  cell count and the shortfall. Throwing instead would refuse to produce an image at all; relaxing
+  silently is what made the original bug invisible. Keep the warning.
+- **`IsUsedNearby` only scans already-assigned cells** — rows above, plus the current row up to the
+  previous column — because raster order means later cells hold nothing yet. That is still symmetric in
+  effect: if A rejects B, B was placed first and A moved, so no surviving pair inside the radius is
+  equal. It does not need a forward scan; it needs the caller to exclude rather than penalise.
+- **Stages relax constantly and deliberately don't warn.** A preview built from the first 200 tiles
+  cannot honour a radius meant for 20,000, so `StageWriter` discards the out-parameters.
+- Tests assert the guarantee over **every cell pair within the radius**, from the rendered pixels, not
+  `DistinctTiles > 1`. The old assertion passed for years against the broken penalty because using two
+  tiles somewhere satisfies it. `Repeat_distance_zero_allows_repeats` pins the other direction.
+- **Repeat-distance tests must use `CreateDistinctTileFolder`, not `CreateTileFolder`.** The latter
+  cycles 8 palette colours × 4 brightness steps, so it only yields 32 distinct appearances and tile 000
+  is pixel-identical to tile 032 — two different files that render identically read as a violation the
+  matcher never committed. This cost a debugging cycle; the fixture, not the code, was wrong.
+
 ## Intermediate stage images
 
 A run over tens of thousands of images spends most of its time loading tiles, so every
@@ -106,18 +160,23 @@ A run over tens of thousands of images spends most of its time loading tiles, so
 output. Stage 1 built from 200 tiles looks blocky, stage 6 from 20,000 looks nearly final — that
 progression is the point.
 
-This is why `BuildAsync` analyses the base image **before** loading tiles even though matching needs
-both: the cell signatures depend only on the base image, and having them ready is what makes a preview
-possible while tiles are still decoding.
+Base analysis and tile loading run **concurrently** (see "Parallelism"), so a stage can fall due before
+the cell signatures exist. `StageWriter` therefore takes the `Task<BaseAnalysis>` rather than its
+result and awaits it *inside* the stage claim: the claim is exclusive, so at most one loader thread ever
+parks there. Don't "fix" that into a `IsCompletedSuccessfully` check-and-skip — it drops every early
+stage, and on a short run that means no previews at all.
 
 - **A stage must never change the final mosaic.** `Assign` keeps its use counts in a local array rather
   than on `Tile`, which is what makes calling it twice safe; a stage only reads tile pixels.
   `Stages_do_not_change_the_final_mosaic` compares a staged run against an unstaged one byte for byte.
   If you add state to `Tile` or to matching, keep it out of `Assign`.
-- **A stage is a preview, not a small mosaic.** Reuse caps are ignored (a stage from the first 200
-  tiles must not fail where the finished mosaic succeeds), likeness is not scored, and tiles arrive in
-  load order, so stages are not reproducible. The final mosaic is — `TileLibrary` sorts by path before
-  returning, because tile order decides ties in matching.
+- **A stage is a preview, not a small mosaic.** Likeness is not scored, and tiles arrive in load order,
+  so stages are not reproducible. The final mosaic is — `TileLibrary` sorts by path before returning,
+  because tile order decides ties in matching.
+- **A stage obeys `--max-reuse` too; it is skipped when it cannot.** It used to pass `maxTileReuse: 0`,
+  i.e. quietly ignore the cap. The options are instructions, not hints: when too few tiles have loaded
+  to fill the grid inside the cap, the stage is skipped (its number is given back) and the next one gets
+  it right. Never break a stated limit to produce a picture.
 - **Only one stage renders at a time, and it backs off by what it cost.** The due check runs on
   whichever loader thread reaches it first, so `StageSchedule.TryClaim`/`Release` is the mutual
   exclusion. `BackoffFactor` caps stages at 1/4 of wall clock, so a 20s render on a huge grid settles
@@ -141,6 +200,34 @@ interrupted at minute nine — Ctrl-C, a crash, a full disk — leaves *nothing*
 time. Verified: killing a 3,000-tile run at 0.3s left an 11.5 MB cache (of 27.8 MB full) that the next
 run reused for exactly 1,241 tiles, producing a mosaic byte-identical to a run from an empty cache.
 
+### The file format (v2)
+
+Little-endian, written with `BinaryWriter`. A 12-byte header, then one record per tile, then nothing —
+**no count, no index, no footer**, which is what makes a new entry a single append:
+
+```
+header  uint32  Magic         0x47524441  "GRDA"
+        int32   FormatVersion 2
+        int32   tileSize      pixels per side, so a mismatched file is rejected outright
+
+record  uint32  RecordMarker  0x54494C45  "TILE"
+        string  path          BinaryWriter 7-bit-encoded length prefix, UTF-8, absolute
+        int64   length        source file size, for staleness
+        int64   ticks         source LastWriteTimeUtc.Ticks, for staleness
+        byte[]  pixels        tileSize * tileSize * 4, raw RGBA, no compression
+```
+
+A record is `4 + (1..2 + bytes(path)) + 8 + 8 + tileSize²·4` bytes — 4,117 plus the path at
+`TileSize=32`. Duplicate paths are legal and **last one wins**; that is how a re-decoded stale entry
+supersedes its predecessor without a rewrite, and `Save` compacts them away later.
+
+**Yes, the run is interruptible, and the cache is why.** Reading stops at the first byte that is not a
+valid record, so a half-written tail from a `kill -9` is simply dropped and everything before it is
+kept; the next append truncates to that offset before writing. Verified: a hard kill 0.35s into a
+3,000-tile run left a 2.9 MB cache that the next run reused for exactly **717 tiles**, and that run
+produced a mosaic **byte-identical** to one built from a full cache. Cancellation itself is a
+`CancellationToken` threaded from `Worker.ExecuteAsync` through every phase and every parallel loop.
+
 **The cache key covers only what the cached pixels depend on:** the tiles folder, `TileSize`, the
 per-file identity (path + length + last-write time), and `FormatVersion`.
 
@@ -162,6 +249,14 @@ Rules when touching this code:
   common case (`Save_does_not_rewrite_the_file_when_every_entry_was_appended`); it only rewrites when
   entries must be pruned or a stale entry was re-decoded and superseded on disk. If you make it write
   unconditionally you have restored the multi-megabyte end-of-run stall.
+- **Compare paths as full paths, always.** Entries are keyed on `FileInfo.FullName`, but `Save`'s live
+  list holds paths as they were enumerated — relative whenever the tiles folder was a relative argument,
+  which is the normal way to invoke the tool (`gridart base.png tiles`). Comparing the two forms
+  directly made every entry look deleted, so `Save` pruned the whole cache and rewrote it as a 12-byte
+  header: **the cache never hit once, on any relative run**, while the unit tests (which use absolute
+  temp paths) all passed. `Save_keeps_entries_whose_live_paths_arrive_relative` pins it. The general
+  lesson: a cache that silently misses looks exactly like a slow program, so verify hits by their
+  logged count (`Prepared N tile(s) …, M from cache`), not by the absence of errors.
 - **Appends are flushed per record but not `Flush(true)`.** Forcing the platter on every tile would
   cost more than the decode it protects, and a torn tail is already recoverable.
 - **Reads open with `FileShare.ReadWrite`.** Another process may be appending; a plain `File.OpenRead`
@@ -189,6 +284,43 @@ Rules when touching this code:
 
 The invariant a cache must satisfy is that it changes only speed:
 `Cache_does_not_change_the_output` asserts cold, warm and `--no-cache` runs are byte-identical.
+
+## Parallelism
+
+Every phase that can use the whole machine does. `MosaicBuilder.CpuBound` is the single place the
+degree of parallelism is set (`Environment.ProcessorCount`), and it carries the cancellation token, so
+a `Ctrl-C` stops mid-phase instead of at the next phase boundary.
+
+What runs in parallel, and why each is safe:
+
+| Phase | How | Why it is safe |
+| --- | --- | --- |
+| Base analysis ‖ tile loading | `Task.WhenAll` in `BuildAsync` | Cell signatures depend only on the base image; cached/resized tiles only on `TileSize`. Nothing is shared. |
+| `Analysing base image` | `Parallel.For` over cell rows | Read-only on the base image; each row writes only its own signature slots. |
+| `Loading tiles` | `Parallel.ForEachAsync` | Decoding is CPU-bound and per-file; the shared list is under a `Lock`, the cache is a `ConcurrentDictionary` with a file lock for appends. |
+| `Matching tiles` (distances) | `Parallel.For` over a block of cells | A cell's distance to every tile is independent of what other cells chose. |
+| `Rendering mosaic` | `Parallel.For` over cell rows | Each cell row writes a disjoint band of pixel rows. |
+| `Colour matching` | `Parallel.For` over pixel rows | One row in, one row out, no cross-row reads. |
+| `Scoring likeness` | Two `Task.Run` signature passes, then `Parallel.For` over deltas | The two passes read different images and share nothing; each is internally parallel and they simply share the cores. |
+
+Rules:
+
+- **The pick in `Assign` is sequential and must stay that way.** The reuse cap and the repeat-distance
+  exclusion both depend on the cells already placed, so choosing cell *n* is genuinely ordered. Only
+  the distance computation parallelises. Making the pick concurrent would make output
+  non-reproducible *and* break `-d`.
+- **Distances are computed in blocks, not all at once** (`DistanceBlockFloats` = 8 Mi floats / 32 MB,
+  capped at `DistanceBlockCells` = 4096 cells). The full cells × tiles matrix is not an option: 100k
+  cells × 30k tiles is 12 GB. The block keeps the buffer bounded and cache-resident while still
+  feeding every core.
+- **`DangerousGetPixelRowMemory` lives on `ImageFrame<T>`, not `Image<T>`** — go via
+  `.Frames.RootFrame` (or `using SixLabors.ImageSharp.Advanced;`). Concurrent read-only access and
+  concurrent writes to *distinct* rows of one image were both verified to work.
+- **Anything the parallel phases mutate is per-index or interlocked.** Don't add a shared accumulator
+  to one of these loops without one.
+- Measured on 3,000 tiles into a 120×90 grid (10,800 cells, 3840×2880 output) on 16 cores:
+  cold run **0.8s total** — loading 502ms, matching 230ms, rendering 21ms, colour matching 11ms,
+  scoring 33ms. Warm cache: loading **51ms**, total 0.6s.
 
 ## Progress reporting
 
@@ -288,8 +420,28 @@ percentage, `SetTotal`, concurrent `Advance`, and double `Dispose`. The internal
 `LoggingProgressReporter(ILogger, TimeSpan)` constructor exists so tests can shorten the update
 interval instead of sleeping through it.
 
+`StageAndIncrementalCacheTests.cs` covers the two things that make a run over tens of thousands of
+images survivable, and both are asserted as observable behaviour rather than as calls made:
+
+- the cache is readable *before* `Save` is called, a torn final record is dropped while earlier ones
+  survive, the next append truncates the garbage, and `Save` leaves `LastWriteTimeUtc` untouched when
+  every entry was already appended;
+- a partial cache from a simulated Ctrl-C is reused *and* yields a mosaic byte-identical to one built
+  from an empty cache — present-but-wrong is the failure mode worth catching;
+- stages appear during loading at the final dimensions, numbered consecutively from 001 beside the
+  output with its extension, are absent at interval 0 or for a run shorter than the interval, do not
+  change the final mosaic (byte-for-byte against an unstaged run), and do not break a run when the
+  stage path cannot be written;
+- `StageSchedule` is unit-tested directly for one-at-a-time claiming, giving a number back when a
+  claim produced nothing, and backing off by the last stage's cost.
+
+Its `FastStageInterval` is a *microsecond*, not a plausible-looking 0.01s: the fixtures load in a few
+milliseconds, so anything a human would type leaves the run finished before the first stage is due,
+and the stage tests silently pass with zero stages written.
+
 When you change matching or rendering, keep those invariants covered. `InternalsVisibleTo` in
-`src/gridart.csproj` exposes internals such as `MosaicBuilder.ResolveGrid` to the test project.
+`src/gridart.csproj` exposes internals such as `MosaicBuilder.ResolveGrid` and `StageSchedule` to the
+test project.
 
 ## Known limitations
 

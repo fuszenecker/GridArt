@@ -164,25 +164,162 @@ public sealed class MosaicBuilderTests : IDisposable
         Assert.True(flatCells < cells * 0.1, $"{flatCells} of {cells} cells were flat — tile detail was lost.");
     }
 
-    [Fact]
-    public async Task Repeat_avoidance_prevents_adjacent_duplicates()
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public async Task Repeat_distance_is_honoured_for_every_cell_pair(int radius)
     {
-        // A single flat-colour base would otherwise pick the same nearest tile for every cell.
-        var basePath = CreateSolidImage("flat.png", 200, 200, new Rgba32(120, 120, 120));
-        var tiles = CreateTileFolder("tiles", 40);
+        // A flat base is the adversarial case: every cell has the same nearest tile, so nothing but the
+        // radius itself stops the mosaic from being one image tiled over and over. This asserts the
+        // actual guarantee -d makes — no two cells within the radius share a tile — rather than the
+        // far weaker "more than one distinct tile was used", which passed while -d was still a
+        // soft score penalty that a repeat could simply outweigh.
+        var basePath = CreateSolidImage($"flat{radius}.png", 200, 200, new Rgba32(120, 120, 120));
+        var tiles = CreateDistinctTileFolder($"tiles{radius}", 120);
 
         using var result = await BuildAsync(new MosaicOptions
         {
             BaseImage = basePath,
             TilesFolder = tiles,
             TilesAcross = 10,
-            TileSize = 10,
-            RepeatAvoidanceRadius = 1,
+            TileSize = 8,
+            RepeatAvoidanceRadius = radius,
             ColorAdjustStrength = 0d,
         });
 
-        Assert.True(result.Quality.DistinctTiles > 1,
-            "Repeat avoidance should have forced more than one distinct tile on a flat base.");
+        AssertNoRepeatWithinRadius(result, radius);
+    }
+
+    [Fact]
+    public async Task Repeat_distance_is_honoured_on_a_real_gradient_too()
+    {
+        // Not just the flat pathological case: a gradient gives matching a genuine preference per cell,
+        // which is exactly where a soft penalty used to lose.
+        var basePath = CreateGradientImage("gradient.png", 240, 240);
+        var tiles = CreateDistinctTileFolder("gradient-tiles", 150);
+
+        using var result = await BuildAsync(new MosaicOptions
+        {
+            BaseImage = basePath,
+            TilesFolder = tiles,
+            TilesAcross = 12,
+            TileSize = 8,
+            RepeatAvoidanceRadius = 2,
+            ColorAdjustStrength = 0d,
+        });
+
+        AssertNoRepeatWithinRadius(result, 2);
+    }
+
+    [Fact]
+    public async Task Repeat_distance_zero_allows_repeats()
+    {
+        // The opposite guarantee: -d 0 must not secretly enforce anything, or the flat case could no
+        // longer collapse onto its single best tile.
+        var basePath = CreateSolidImage("flat-zero.png", 160, 160, new Rgba32(120, 120, 120));
+        var tiles = CreateTileFolder("zero-tiles", 40);
+
+        using var result = await BuildAsync(new MosaicOptions
+        {
+            BaseImage = basePath,
+            TilesFolder = tiles,
+            TilesAcross = 10,
+            TileSize = 8,
+            RepeatAvoidanceRadius = 0,
+            ColorAdjustStrength = 0d,
+        });
+
+        Assert.Equal(1, result.Quality.DistinctTiles);
+    }
+
+    [Fact]
+    public async Task Too_few_tiles_relaxes_the_repeat_distance_instead_of_failing()
+    {
+        // A radius of 3 needs ~24 already-placed neighbours to differ; with 6 tiles that is impossible.
+        // Producing an image and warning beats throwing, but it must still be an image.
+        var basePath = CreateSolidImage("cramped.png", 160, 160, new Rgba32(120, 120, 120));
+        var tiles = CreateDistinctTileFolder("cramped-tiles", 6);
+
+        using var result = await BuildAsync(new MosaicOptions
+        {
+            BaseImage = basePath,
+            TilesFolder = tiles,
+            TilesAcross = 10,
+            TileSize = 8,
+            RepeatAvoidanceRadius = 3,
+            ColorAdjustStrength = 0d,
+        });
+
+        Assert.Equal(10, result.Columns);
+        Assert.Equal(10, result.Rows);
+
+        // Even when relaxed, it must still do as well as the tile count allows: 6 tiles cannot repeat
+        // inside a radius of 1 either, but they can and must all be used.
+        Assert.Equal(6, result.Quality.DistinctTiles);
+    }
+
+    /// <summary>
+    /// Asserts the guarantee <c>-d</c> makes: no two cells whose Chebyshev distance is within
+    /// <paramref name="radius"/> were given the same tile. Reads the rendered pixels rather than the
+    /// internal assignment, so it would catch a rendering mix-up too.
+    /// </summary>
+    private static void AssertNoRepeatWithinRadius(MosaicResult result, int radius)
+    {
+        var tileSize = result.Image.Width / result.Columns;
+        var fingerprints = new string[result.Columns * result.Rows];
+
+        for (var row = 0; row < result.Rows; row++)
+        {
+            for (var col = 0; col < result.Columns; col++)
+            {
+                fingerprints[row * result.Columns + col] =
+                    CellFingerprint(result.Image, new Rectangle(col * tileSize, row * tileSize, tileSize, tileSize));
+            }
+        }
+
+        for (var row = 0; row < result.Rows; row++)
+        {
+            for (var col = 0; col < result.Columns; col++)
+            {
+                var mine = fingerprints[row * result.Columns + col];
+
+                for (var r = row; r <= Math.Min(result.Rows - 1, row + radius); r++)
+                {
+                    for (var c = Math.Max(0, col - radius); c <= Math.Min(result.Columns - 1, col + radius); c++)
+                    {
+                        if (r == row && c <= col)
+                        {
+                            continue; // Same cell, or a pair already checked from the other side.
+                        }
+
+                        Assert.False(
+                            fingerprints[r * result.Columns + c] == mine,
+                            $"Cells ({col},{row}) and ({c},{r}) are within radius {radius} but use the same tile.");
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>Exact pixel content of one cell, so two cells are "the same tile" only if identical.</summary>
+    private static string CellFingerprint(Image<Rgba32> image, Rectangle cell)
+    {
+        var builder = new System.Text.StringBuilder(cell.Width * cell.Height * 4);
+
+        image.ProcessPixelRows(accessor =>
+        {
+            for (var y = cell.Top; y < cell.Bottom; y++)
+            {
+                var row = accessor.GetRowSpan(y);
+                for (var x = cell.Left; x < cell.Right; x++)
+                {
+                    builder.Append(row[x].PackedValue).Append(',');
+                }
+            }
+        });
+
+        return builder.ToString();
     }
 
     [Fact]
@@ -853,6 +990,63 @@ public sealed class MosaicBuilderTests : IDisposable
         using var image = new Image<Rgba32>(width, height, color);
         image.Save(path);
         return path;
+    }
+
+    /// <summary>A smooth two-axis gradient: every cell has a genuinely different best match.</summary>
+    private string CreateGradientImage(string name, int width, int height)
+    {
+        var path = Path.Combine(root, name);
+        using var image = new Image<Rgba32>(width, height);
+
+        for (var y = 0; y < height; y++)
+        {
+            for (var x = 0; x < width; x++)
+            {
+                image[x, y] = new Rgba32(
+                    (byte)(255 * x / (width - 1)),
+                    (byte)(255 * y / (height - 1)),
+                    (byte)(255 - 255 * x / (width - 1)));
+            }
+        }
+
+        image.Save(path);
+        return path;
+    }
+
+    /// <summary>
+    /// Builds <paramref name="count"/> tiles that are all <b>visually distinct</b>, by ramping
+    /// brightness continuously with the index instead of cycling it.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="CreateTileFolder"/> cycles through 8 palette colours × 4 brightness steps, so it only
+    /// yields 32 distinct appearances and tile 000 is pixel-identical to tile 032. That is fine for the
+    /// likeness tests but useless for the repeat-distance tests, which compare rendered cell pixels:
+    /// two different files that look the same are indistinguishable in the output and would read as a
+    /// repeat-distance violation that the matcher never committed.
+    /// </remarks>
+    private string CreateDistinctTileFolder(string name, int count)
+    {
+        var folder = Path.Combine(root, name);
+        Directory.CreateDirectory(folder);
+
+        for (var i = 0; i < count; i++)
+        {
+            var baseColor = Palette[i % Palette.Length];
+
+            // Strictly increasing in i, so two tiles sharing a palette colour never share a brightness.
+            var scale = count == 1 ? 1f : 0.35f + 0.65f * i / (count - 1);
+
+            var color = new Rgba32(
+                (byte)(baseColor.R * scale),
+                (byte)(baseColor.G * scale),
+                (byte)(baseColor.B * scale),
+                byte.MaxValue);
+
+            using var tile = new Image<Rgba32>(64, 64, color);
+            tile.Save(Path.Combine(folder, $"tile{i:D3}.png"));
+        }
+
+        return folder;
     }
 
     /// <summary>

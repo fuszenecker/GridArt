@@ -126,6 +126,35 @@ public sealed class StageAndIncrementalCacheTests : IDisposable
     }
 
     [Fact]
+    public void Save_keeps_entries_whose_live_paths_arrive_relative()
+    {
+        // `gridart base.png tiles` enumerates relative paths, while entries are keyed on FullName.
+        // Comparing the two forms directly made every entry look deleted, so Save pruned the entire
+        // cache and rewrote it empty — the cache never hit, on any run, from any relative invocation.
+        var tiles = CreateTileFolder("relative", 5);
+        var cacheDir = Path.Combine(root, "relative-cache");
+
+        var writer = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance);
+        foreach (var file in Directory.GetFiles(tiles).Order())
+        {
+            using var image = new Image<Rgba32>(8, 8, new Rgba32(50, 60, 70));
+            writer.Set(new FileInfo(file), image);
+        }
+
+        // Relative to the real working directory rather than by changing it: the current directory is
+        // process-global and xUnit runs test classes in parallel.
+        var cwd = Directory.GetCurrentDirectory();
+        var relative = Directory.GetFiles(tiles)
+            .Select(file => Path.GetRelativePath(cwd, file))
+            .ToArray();
+        Assert.False(Path.IsPathRooted(relative[0]), "The fixture must exercise relative paths.");
+
+        Assert.False(writer.Save(relative), "Nothing is stale, so nothing may be pruned or rewritten.");
+        writer.Dispose();
+        Assert.Equal(5, TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance).LoadedCount);
+    }
+
+    [Fact]
     public void Save_still_compacts_when_entries_must_be_pruned()
     {
         var tiles = CreateTileFolder("tiles", 6);

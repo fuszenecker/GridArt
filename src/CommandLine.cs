@@ -20,7 +20,7 @@ public static class CommandLine
           -g, --signature-grid <n>       Match patches per axis, 1-16 (default 3)
           -c, --color-adjust <0-1>       Tint toward the base image (default 0.35)
           -r, --max-reuse <n>            Max placements per image, 0 = unlimited (default 0)
-          -d, --repeat-distance <n>      Cells to keep between repeats (default 2)
+          -d, --repeat-distance <n>      Cells that must separate two uses of one image (default 2)
               --recursive <bool>         Scan subfolders (default true)
           -f, --overwrite                Replace an existing output file
               --no-cache                 Skip the decoded-tile cache for this run
@@ -34,6 +34,10 @@ public static class CommandLine
         size and timestamp are unchanged, so an interrupted run resumes instead of starting over.
         The cache is keyed on the tiles folder and --tile-size only, so changing any other option
         still hits the cache.
+
+        --repeat-distance is a hard rule, not a preference: no two cells within that many cells of
+        each other get the same image. It is relaxed for a single cell only when no image is left to
+        choose from, and the run warns when that happens — add more images or lower --tiles-across.
 
         While tiles load, a preview mosaic is written every --stage-interval seconds as
         <output>.stage-NNN.<ext>, so the development is visible on long runs over many images.

@@ -250,7 +250,13 @@ public sealed class TileCache : IDisposable
         {
             try
             {
-                var live = new HashSet<string>(livePaths, StringComparer.OrdinalIgnoreCase);
+                // Expanded to full paths before comparing. Entries are keyed on FileInfo.FullName, but
+                // the live list holds the paths as they were enumerated, which are relative whenever the
+                // tiles folder was given as a relative argument — `gridart base.png tiles`. Comparing the
+                // two forms directly made every entry look stale, so a run pruned the whole cache and
+                // rewrote it empty: the cache never once hit.
+                var live = new HashSet<string>(
+                    livePaths.Select(static p => Path.GetFullPath(p)), StringComparer.OrdinalIgnoreCase);
                 var stale = entries.Keys.Where(k => !live.Contains(k)).ToArray();
 
                 foreach (var key in stale)
