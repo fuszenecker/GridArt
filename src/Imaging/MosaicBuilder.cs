@@ -81,25 +81,9 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
         }
 
         // Keyed on the tiles folder and TileSize only — the two things the cached pixels depend on.
-        var cache = options.NoCache
+        using var cache = options.NoCache
             ? null
             : TileCache.Open(options.CacheDirectory, options.TilesFolder, options.TileSize, logger);
-
-        using var library = await TileLibrary.LoadAsync(
-            options.TilesFolder, cellSize, options.SignatureGrid, options.Recursive, logger,
-            cancellationToken, cache, progress);
-
-        if (options.MaxTileReuse > 0)
-        {
-            var capacity = (long)library.Tiles.Count * options.MaxTileReuse;
-            if (capacity < (long)columns * rows)
-            {
-                throw new InvalidOperationException(
-                    $"{library.Tiles.Count} tile(s) with MaxTileReuse={options.MaxTileReuse} can fill only " +
-                    $"{capacity} of {(long)columns * rows} cells. Add more images, raise MaxTileReuse " +
-                    "(0 = unlimited), or lower TilesAcross.");
-            }
-        }
 
         // The base image is resampled to the exact output size once; the per-pixel colour-adjust step
         // then has a matching target pixel for every mosaic pixel, so tinting can follow gradients
@@ -119,6 +103,9 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
 
         var cellCount = (long)columns * rows;
 
+        // Analysing the base image comes *before* loading tiles even though matching needs both. It
+        // depends only on the base image, and having it ready up front is what lets intermediate
+        // previews be rendered while tens of thousands of tiles are still decoding.
         ColorSignature[] cellSignatures;
         using (var phase = progress.Begin("Analysing base image", cellCount, "cells"))
         {
@@ -126,10 +113,31 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                 baseImage, columns, rows, options.SignatureGrid, phase, cancellationToken);
         }
 
+        var stages = StageWriter.Create(
+            options, cellSignatures, columns, rows, baseAtOutputScale, logger, progress);
+
+        using var library = await TileLibrary.LoadAsync(
+            options.TilesFolder, cellSize, options.SignatureGrid, options.Recursive, logger,
+            cancellationToken, cache, progress, stages);
+
+        if (options.MaxTileReuse > 0)
+        {
+            var capacity = (long)library.Tiles.Count * options.MaxTileReuse;
+            if (capacity < cellCount)
+            {
+                throw new InvalidOperationException(
+                    $"{library.Tiles.Count} tile(s) with MaxTileReuse={options.MaxTileReuse} can fill only " +
+                    $"{capacity} of {cellCount} cells. Add more images, raise MaxTileReuse " +
+                    "(0 = unlimited), or lower TilesAcross.");
+            }
+        }
+
         int[] assignment;
         using (var phase = progress.Begin("Matching tiles", cellCount, "cells"))
         {
-            assignment = Assign(cellSignatures, library, columns, rows, options, phase, cancellationToken);
+            assignment = Assign(
+                cellSignatures, library.Tiles, columns, rows,
+                options.RepeatAvoidanceRadius, options.MaxTileReuse, phase, cancellationToken);
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -137,7 +145,7 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
         Image<Rgba32> mosaic;
         using (var phase = progress.Begin("Rendering mosaic", cellCount, "tiles"))
         {
-            mosaic = Render(assignment, library, columns, rows, options.TileSize, phase);
+            mosaic = Render(assignment, library.Tiles, columns, rows, options.TileSize, phase);
         }
 
         try
@@ -235,21 +243,27 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
     /// Greedy nearest-signature assignment with reuse caps and local repeat avoidance. Cells are
     /// visited in a fixed order, so a run is reproducible for the same inputs and options.
     /// </summary>
-    private int[] Assign(
+    /// <remarks>
+    /// Use counts are local to the call rather than stored on <see cref="Tile"/>. That keeps the method
+    /// free of side effects on the library, which is what lets an intermediate stage render from the
+    /// same tiles without perturbing the final mosaic.
+    /// </remarks>
+    private static int[] Assign(
         ColorSignature[] cellSignatures,
-        TileLibrary library,
+        IReadOnlyList<Tile> tiles,
         int columns,
         int rows,
-        MosaicOptions options,
+        int repeatAvoidanceRadius,
+        int maxTileReuse,
         IProgressPhase? phase = null,
         CancellationToken cancellationToken = default)
     {
-        var tiles = library.Tiles;
         var assignment = new int[columns * rows];
         Array.Fill(assignment, -1);
 
-        var radius = options.RepeatAvoidanceRadius;
-        var reuseCap = options.MaxTileReuse == 0 ? int.MaxValue : options.MaxTileReuse;
+        var useCounts = new int[tiles.Count];
+        var radius = repeatAvoidanceRadius;
+        var reuseCap = maxTileReuse == 0 ? int.MaxValue : maxTileReuse;
 
         for (var row = 0; row < rows; row++)
         {
@@ -264,13 +278,12 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
 
                 for (var t = 0; t < tiles.Count; t++)
                 {
-                    var tile = tiles[t];
-                    if (tile.UseCount >= reuseCap)
+                    if (useCounts[t] >= reuseCap)
                     {
                         continue;
                     }
 
-                    var score = cell.DistanceTo(tile.Signature);
+                    var score = cell.DistanceTo(tiles[t].Signature);
                     if (score >= bestScore)
                     {
                         // Even the unpenalised score already loses; skip the neighbour scan.
@@ -294,11 +307,11 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                 {
                     throw new InvalidOperationException(
                         $"Ran out of usable tiles at cell ({col}, {row}) because every image hit the " +
-                        $"MaxTileReuse limit of {options.MaxTileReuse}.");
+                        $"MaxTileReuse limit of {maxTileReuse}.");
                 }
 
                 assignment[cellIndex] = bestTile;
-                tiles[bestTile].UseCount++;
+                useCounts[bestTile]++;
             }
 
             phase?.Advance(columns);
@@ -333,7 +346,7 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
 
     private static Image<Rgba32> Render(
         int[] assignment,
-        TileLibrary library,
+        IReadOnlyList<Tile> tiles,
         int columns,
         int rows,
         int tileSize,
@@ -348,7 +361,7 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                 {
                     for (var col = 0; col < columns; col++)
                     {
-                        var tile = library.Tiles[assignment[row * columns + col]];
+                        var tile = tiles[assignment[row * columns + col]];
                         ctx.DrawImage(tile.Pixels, new Point(col * tileSize, row * tileSize), 1f);
                     }
 
@@ -442,5 +455,148 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
             P95DeltaE: deltas[p95Index],
             WorstDeltaE: deltas[^1],
             DistinctTiles: assignment.Distinct().Count());
+    }
+
+    /// <summary>
+    /// Renders a mosaic from the tiles loaded so far and writes it beside the real output, so a run
+    /// over tens of thousands of images shows its development instead of going quiet for many minutes.
+    /// </summary>
+    /// <remarks>
+    /// A stage is a preview and is deliberately not the same computation as the final mosaic:
+    /// <list type="bullet">
+    /// <item>reuse caps are ignored, so a stage built from the first few hundred tiles cannot fail
+    /// where the finished mosaic would succeed;</item>
+    /// <item>likeness is not scored — that is two extra passes over the grid for a throwaway image;</item>
+    /// <item>tiles arrive in load order rather than sorted order, so stages are not reproducible.
+    /// The final mosaic is, and nothing here touches it: <see cref="Assign"/> keeps its use counts
+    /// local, and the tile pixels are only read.</item>
+    /// </list>
+    /// </remarks>
+    private sealed class StageWriter : ITileStageWriter
+    {
+        private readonly StageSchedule schedule;
+        private readonly ColorSignature[] cellSignatures;
+        private readonly int columns;
+        private readonly int rows;
+        private readonly int tileSize;
+        private readonly float colorAdjustStrength;
+        private readonly int repeatAvoidanceRadius;
+        private readonly Image<Rgba32> baseAtOutputScale;
+        private readonly string pathWithoutExtension;
+        private readonly string extension;
+        private readonly ILogger logger;
+        private readonly IProgressReporter progress;
+
+        private StageWriter(
+            MosaicOptions options,
+            ColorSignature[] cellSignatures,
+            int columns,
+            int rows,
+            Image<Rgba32> baseAtOutputScale,
+            ILogger logger,
+            IProgressReporter progress)
+        {
+            schedule = new StageSchedule(TimeSpan.FromSeconds(options.StageIntervalSeconds));
+            this.cellSignatures = cellSignatures;
+            this.columns = columns;
+            this.rows = rows;
+            tileSize = options.TileSize;
+            colorAdjustStrength = (float)options.ColorAdjustStrength;
+            repeatAvoidanceRadius = options.RepeatAvoidanceRadius;
+            this.baseAtOutputScale = baseAtOutputScale;
+            this.logger = logger;
+            this.progress = progress;
+
+            var output = options.ResolveOutputPath();
+            extension = Path.GetExtension(output) is { Length: > 0 } ext ? ext : ".png";
+            pathWithoutExtension = Path.Combine(
+                Path.GetDirectoryName(output) ?? ".",
+                Path.GetFileNameWithoutExtension(output));
+        }
+
+        /// <summary>Returns null when stages are switched off, so the load loop skips the check entirely.</summary>
+        public static ITileStageWriter? Create(
+            MosaicOptions options,
+            ColorSignature[] cellSignatures,
+            int columns,
+            int rows,
+            Image<Rgba32> baseAtOutputScale,
+            ILogger logger,
+            IProgressReporter progress)
+        {
+            if (options.StageIntervalSeconds <= 0)
+            {
+                return null;
+            }
+
+            return new StageWriter(
+                options, cellSignatures, columns, rows, baseAtOutputScale, logger, progress);
+        }
+
+        public async Task<bool> TryWriteAsync(
+            Func<IReadOnlyList<Tile>> snapshot, CancellationToken cancellationToken)
+        {
+            // Claiming is what makes this exclusive: the check runs on whichever loader thread gets
+            // here first, and only one may render at a time.
+            if (!schedule.TryClaim(out var index))
+            {
+                return false;
+            }
+
+            var clock = Stopwatch.StartNew();
+            var produced = false;
+
+            try
+            {
+                var tiles = snapshot();
+                if (tiles.Count == 0)
+                {
+                    return false;
+                }
+
+                var path = $"{pathWithoutExtension}.stage-{index:D3}{extension}";
+
+                // Stages are written long before the Worker saves the real output, so the output
+                // folder may not exist yet.
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+
+                using (progress.Begin($"Stage {index} from {tiles.Count:N0} tile(s)"))
+                {
+                    var assignment = Assign(
+                        cellSignatures, tiles, columns, rows,
+                        repeatAvoidanceRadius, maxTileReuse: 0, phase: null, cancellationToken);
+
+                    using var mosaic = Render(assignment, tiles, columns, rows, tileSize);
+
+                    if (colorAdjustStrength > 0f)
+                    {
+                        ApplyColorAdjust(mosaic, baseAtOutputScale, colorAdjustStrength);
+                    }
+
+                    await mosaic.SaveAsync(path, cancellationToken);
+                }
+
+                produced = true;
+                logger.LogInformation(
+                    "Stage {Index} written to {Path} from the first {Tiles:N0} tile(s).",
+                    index, path, tiles.Count);
+
+                return true;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // A preview is never worth failing a run that may already be minutes in.
+                logger.LogWarning("Could not write an intermediate stage: {Reason}", ex.Message);
+                return false;
+            }
+            finally
+            {
+                schedule.Release(clock.Elapsed, produced);
+            }
+        }
     }
 }

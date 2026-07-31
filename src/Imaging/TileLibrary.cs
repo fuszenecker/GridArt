@@ -23,10 +23,24 @@ public sealed class Tile : IDisposable
 
     public ColorSignature Signature { get; }
 
-    /// <summary>Number of times this tile has been placed in the mosaic so far.</summary>
-    public int UseCount { get; set; }
-
     public void Dispose() => Pixels.Dispose();
+}
+
+/// <summary>
+/// Renders an intermediate mosaic from the tiles loaded so far. Implemented by
+/// <c>MosaicBuilder.StageWriter</c>; the interface exists so tile loading can offer the hook without
+/// knowing how a mosaic is built.
+/// </summary>
+public interface ITileStageWriter
+{
+    /// <summary>
+    /// Writes a stage if one is due, and returns whether it did.
+    /// </summary>
+    /// <param name="snapshot">
+    /// Produces the tiles available right now. Called only when a stage is actually due, so the cost of
+    /// copying the list is not paid on every loaded tile.
+    /// </param>
+    Task<bool> TryWriteAsync(Func<IReadOnlyList<Tile>> snapshot, CancellationToken cancellationToken);
 }
 
 /// <summary>
@@ -55,7 +69,8 @@ public sealed class TileLibrary : IDisposable
         ILogger logger,
         CancellationToken cancellationToken,
         TileCache? cache = null,
-        IProgressReporter? progress = null)
+        IProgressReporter? progress = null,
+        ITileStageWriter? stages = null)
     {
         progress ??= NullProgressReporter.Instance;
 
@@ -90,9 +105,11 @@ public sealed class TileLibrary : IDisposable
 
         logger.LogDebug("Loading {Count} candidate tile images from {Folder}.", candidates.Length, folder);
 
-        // Decoding dominates load time and is CPU-bound, so fan out across cores. The bag keeps the
-        // parallel writes lock-free; results are re-sorted afterwards for deterministic output.
-        var loaded = new System.Collections.Concurrent.ConcurrentBag<Tile>();
+        // Decoding dominates load time and is CPU-bound, so fan out across cores. A plain List under a
+        // lock rather than a ConcurrentBag: an intermediate stage needs a snapshot of what has loaded
+        // so far, which a bag cannot give without enumerating it concurrently with the writes.
+        var loaded = new List<Tile>(candidates.Length);
+        var loadedLock = new Lock();
         var failures = 0;
         var cacheHits = 0;
 
@@ -136,12 +153,19 @@ public sealed class TileLibrary : IDisposable
                     {
                         if (!fromCache)
                         {
+                            // Appends straight to the cache file, so the decode survives an
+                            // interrupted run instead of being thrown away.
                             cache?.Set(file, image);
                         }
 
                         var signature = ColorSignature.Compute(image, signatureGrid);
-                        loaded.Add(new Tile(path, image, signature));
+                        var tile = new Tile(path, image, signature);
                         image = null;
+
+                        lock (loadedLock)
+                        {
+                            loaded.Add(tile);
+                        }
                     }
                     finally
                     {
@@ -157,28 +181,38 @@ public sealed class TileLibrary : IDisposable
                 {
                     loadPhase.Advance();
                 }
+
+                if (stages is not null)
+                {
+                    // Runs on this loader thread, so one core renders the preview while the rest keep
+                    // decoding. The snapshot is only taken if a stage is actually due.
+                    await stages.TryWriteAsync(
+                        () =>
+                        {
+                            lock (loadedLock)
+                            {
+                                return loaded.ToArray();
+                            }
+                        },
+                        token);
+                }
             });
 
         loadPhase.Dispose();
 
+        // Tiles were appended to the cache as they decoded; this only prunes deleted files and
+        // compacts records superseded during the run, so it is usually a no-op.
         if (cache is not null)
         {
-            var decoded = loaded.Count - cacheHits;
-
-            // Nothing new to store and nothing to prune is the common warm-cache case; skip the phase
-            // entirely rather than announce a no-op.
-            if (decoded > 0 || cache.LoadedCount != loaded.Count)
+            using var savePhase = progress.Begin("Finalising tile cache", unit: "entries");
+            if (cache.Save(loaded.Select(t => t.Path).ToArray()))
             {
-                using var savePhase = progress.Begin("Saving tile cache", unit: "entries");
-                cache.Save(loaded.Select(t => t.Path).ToArray());
                 savePhase.Advance(loaded.Count);
-            }
-            else
-            {
-                cache.Save(loaded.Select(t => t.Path).ToArray());
             }
         }
 
+        // Sorted so the finished mosaic is reproducible: tile order decides which of two equally good
+        // candidates wins, and parallel loading finishes in a different order every run.
         var tiles = loaded.OrderBy(t => t.Path, StringComparer.OrdinalIgnoreCase).ToList();
 
         if (tiles.Count == 0)

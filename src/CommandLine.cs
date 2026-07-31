@@ -26,12 +26,17 @@ public static class CommandLine
               --no-cache                 Skip the decoded-tile cache for this run
               --cache-dir <path>         Cache location (default: %LOCALAPPDATA%\GridArt\cache)
               --clear-cache              Delete all cache files before running
+              --stage-interval <s>       Seconds between intermediate stage images, 0 = off (default 60)
           -q, --quiet                    Suppress progress output
           -h, --help                     Show this help
 
-        Decoded, cell-sized tiles are cached on disk and reused when a source file's size and
-        timestamp are unchanged. The cache is keyed on the tiles folder and --tile-size only, so
-        changing any other option still hits the cache.
+        Decoded, cell-sized tiles are cached on disk as they load and reused when a source file's
+        size and timestamp are unchanged, so an interrupted run resumes instead of starting over.
+        The cache is keyed on the tiles folder and --tile-size only, so changing any other option
+        still hits the cache.
+
+        While tiles load, a preview mosaic is written every --stage-interval seconds as
+        <output>.stage-NNN.<ext>, so the development is visible on long runs over many images.
 
         Every option is also settable as configuration, which is how appsettings.json and
         environment variables reach it:
@@ -84,6 +89,7 @@ public static class CommandLine
         Map(nameof(MosaicOptions.CacheDirectory), "", "--cache-dir");
         Map(nameof(MosaicOptions.ClearCache), "", "--clear-cache");
         Map(nameof(MosaicOptions.Quiet), "-q", "--quiet");
+        Map(nameof(MosaicOptions.StageIntervalSeconds), "", "--stage-interval");
 
         return mappings;
     }

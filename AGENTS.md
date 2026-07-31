@@ -28,7 +28,8 @@ the end of every run.
 | `src/Progress/LoggingProgressReporter.cs` | The only implementation: reports phases through `ILogger` |
 | `src/Imaging/MosaicBuilder.cs` | Grid sizing, cell matching, rendering, colour adjust, quality scoring |
 | `src/Imaging/TileLibrary.cs` | Parallel tile loading, resize + centre-crop, fingerprinting |
-| `src/Imaging/TileCache.cs` | On-disk cache of decoded, cell-sized tile pixels |
+| `src/Imaging/TileCache.cs` | Append-as-you-go on-disk cache of decoded, cell-sized tile pixels |
+| `src/Imaging/StageSchedule.cs` | When the next intermediate stage image is due, and its backoff |
 | `src/Imaging/ColorSignature.cs` | Per-region perceptual fingerprint used for matching |
 | `src/Imaging/ColorMath.cs` | sRGB ↔ linear ↔ CIELAB conversions, ΔE |
 | `tests/gridart.Tests/` | xUnit suite over generated fixtures |
@@ -70,6 +71,7 @@ by default, so images in subfolders are included.
 | | `--no-cache` | `NoCache` | false | Skip the decoded-tile cache for this run |
 | | `--cache-dir` | `CacheDirectory` | `%LOCALAPPDATA%\GridArt\cache` | Cache location |
 | | `--clear-cache` | `ClearCache` | false | Delete all cache files before running |
+| | `--stage-interval` | `StageIntervalSeconds` | 60 | Seconds between intermediate stage images; 0 disables them |
 | `-q` | `--quiet` | `Quiet` | false | Drop the per-phase progress lines; results, warnings and errors still log |
 
 Every option is equally settable as configuration — this is not a parallel parser but the same keys
@@ -97,12 +99,47 @@ dotnet run --project src -- --help
 Use `--no-launch-profile` when running with arguments, otherwise `launchSettings.json` chimes in
 with extra output.
 
+## Intermediate stage images
+
+A run over tens of thousands of images spends most of its time loading tiles, so every
+`StageIntervalSeconds` a preview mosaic is written as `<output>.stage-NNN.<ext>` beside the real
+output. Stage 1 built from 200 tiles looks blocky, stage 6 from 20,000 looks nearly final — that
+progression is the point.
+
+This is why `BuildAsync` analyses the base image **before** loading tiles even though matching needs
+both: the cell signatures depend only on the base image, and having them ready is what makes a preview
+possible while tiles are still decoding.
+
+- **A stage must never change the final mosaic.** `Assign` keeps its use counts in a local array rather
+  than on `Tile`, which is what makes calling it twice safe; a stage only reads tile pixels.
+  `Stages_do_not_change_the_final_mosaic` compares a staged run against an unstaged one byte for byte.
+  If you add state to `Tile` or to matching, keep it out of `Assign`.
+- **A stage is a preview, not a small mosaic.** Reuse caps are ignored (a stage from the first 200
+  tiles must not fail where the finished mosaic succeeds), likeness is not scored, and tiles arrive in
+  load order, so stages are not reproducible. The final mosaic is — `TileLibrary` sorts by path before
+  returning, because tile order decides ties in matching.
+- **Only one stage renders at a time, and it backs off by what it cost.** The due check runs on
+  whichever loader thread reaches it first, so `StageSchedule.TryClaim`/`Release` is the mutual
+  exclusion. `BackoffFactor` caps stages at 1/4 of wall clock, so a 20s render on a huge grid settles
+  to one every ~80s instead of saturating a 60s interval.
+- **A failed stage is a warning, never an exception.** Losing a preview must not kill a run that is
+  already minutes in (`Stages_do_not_break_a_run_that_cannot_write_them`).
+- Stage files are numbered consecutively from 1; a claim that produces nothing gives its number back.
+  Stages are written before the Worker saves the real output, so the writer creates the output
+  directory itself.
+
 ## The tile cache
 
 Decoding a folder of full-size photos and resampling each to cell size is the dominant cost of a run
 and is fully deterministic, so the resized pixels are cached in
 `%LOCALAPPDATA%\GridArt\cache\tiles-<folder-hash>-t<TileSize>-v<FormatVersion>.bin`. Measured on 300
 1200×900 JPEGs: 0.6s cold, 0.2s warm.
+
+**Entries are appended as each tile decodes, not collected and written at the end.** With tens of
+thousands of images a cold run takes many minutes, and a single write at the end means a run
+interrupted at minute nine — Ctrl-C, a crash, a full disk — leaves *nothing* and starts from zero next
+time. Verified: killing a 3,000-tile run at 0.3s left an 11.5 MB cache (of 27.8 MB full) that the next
+run reused for exactly 1,241 tiles, producing a mosaic byte-identical to a run from an empty cache.
 
 **The cache key covers only what the cached pixels depend on:** the tiles folder, `TileSize`, the
 per-file identity (path + length + last-write time), and `FormatVersion`.
@@ -115,10 +152,26 @@ key would make every parameter tweak pay full decode cost for nothing —
 
 Rules when touching this code:
 
+- **The file format is an append-friendly record stream: header, then records, no count.** A count in
+  the header would force a full rewrite per entry, which is exactly what appending exists to avoid.
+  Every record starts with `RecordMarker` so a torn tail left by a killed process is recognised as
+  garbage instead of being read as a string length; the reader returns the offset of the last complete
+  record and the next append truncates to it. `A_torn_final_record_is_dropped_and_the_rest_survives`
+  and `Appending_after_a_torn_record_overwrites_the_garbage` pin this.
+- **`Save` is now a compaction step, not the write.** It returns false and touches nothing in the
+  common case (`Save_does_not_rewrite_the_file_when_every_entry_was_appended`); it only rewrites when
+  entries must be pruned or a stale entry was re-decoded and superseded on disk. If you make it write
+  unconditionally you have restored the multi-megabyte end-of-run stall.
+- **Appends are flushed per record but not `Flush(true)`.** Forcing the platter on every tile would
+  cost more than the decode it protects, and a torn tail is already recoverable.
+- **Reads open with `FileShare.ReadWrite`.** Another process may be appending; a plain `File.OpenRead`
+  collides with its write handle and the cache looks unusable. This was a real failure, caught by
+  `Cache_entries_are_readable_before_Save_is_called`.
+- **`TileCache` is `IDisposable`** — it holds an append handle open for the run.
 - **Bump `FormatVersion` if the produced pixels could change** — resize sampler, crop mode, anchor,
   pixel format, or the file layout. It is part of the filename, so old entries are ignored rather
   than silently reused. Forgetting this is the one way to get a *wrong* mosaic from the cache rather
-  than a slow one.
+  than a slow one. (v1 → v2 was the move to appendable records.)
 - **Signatures are never cached**, only pixels. Fingerprinting a cell-sized bitmap is trivially cheap,
   and recomputing it keeps `SignatureGrid` out of the key.
 - **The cache must never fail a run.** Every read/write error is swallowed and logged at debug, then
@@ -143,9 +196,9 @@ A run has long silent stretches (loading 1200 tiles, matching 100k cells), so ev
 through `IProgressReporter`: a start line, throttled interim updates, and a completion line with the
 count, duration and rate.
 
-The phases, in order: `Reading base image`, `Rescaling base image`, `Scanning folder`, `Loading
-tiles`, `Saving tile cache`, `Analysing base image`, `Matching tiles`, `Rendering mosaic`, `Colour
-matching`, `Scoring likeness`, `Saving <file>`.
+The phases, in order: `Reading base image`, `Rescaling base image`, `Analysing base image`, `Scanning
+folder`, `Loading tiles` (with `Stage N from … tile(s)` interleaved), `Finalising tile cache`,
+`Matching tiles`, `Rendering mosaic`, `Colour matching`, `Scoring likeness`, `Saving <file>`.
 
 - **Progress goes through `Microsoft.Extensions.Logging`, never to `Console` directly.** An earlier
   version drew an in-place `\r` bar on stderr; that was removed. Going through `ILogger` means

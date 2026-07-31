@@ -87,6 +87,22 @@ public sealed class MosaicOptions
     /// <summary>Suppresses progress output. Errors and warnings are still logged.</summary>
     public bool Quiet { get; set; }
 
+    /// <summary>
+    /// How often, in seconds, an intermediate mosaic is written while tiles are still loading, as
+    /// <c>&lt;output&gt;.stage-NNN.&lt;ext&gt;</c>. 0 disables it.
+    /// </summary>
+    /// <remarks>
+    /// With tens of thousands of images, loading alone runs for many minutes; a stage file makes that
+    /// development visible instead of leaving a run with nothing to look at until it finishes. Stages
+    /// are previews built from the tiles loaded so far — see <c>MosaicBuilder.StageWriter</c> for how
+    /// they differ from the final mosaic.
+    /// </remarks>
+    /// <remarks>
+    /// Fractional values are accepted so tests can exercise stages without running for a minute.
+    /// </remarks>
+    [Range(0d, 86400d)]
+    public double StageIntervalSeconds { get; set; } = 60;
+
     /// <summary>Overwrite <see cref="OutputPath"/> if it already exists.</summary>
     public bool Overwrite { get; set; }
 

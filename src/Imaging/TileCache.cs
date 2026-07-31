@@ -16,6 +16,14 @@ namespace gridart.Imaging;
 /// the same cell-sized bitmap. That result is what gets cached.
 /// </para>
 /// <para>
+/// <b>Entries are appended as each tile is decoded, not collected and written at the end.</b> With tens
+/// of thousands of images a cold run takes many minutes, and a single write at the end means a run
+/// interrupted at minute nine — Ctrl-C, a crash, a full disk, a laptop lid — leaves nothing behind and
+/// starts from zero next time. The file format is therefore a plain record stream with no count in the
+/// header, so a new entry costs one append instead of a full rewrite. A resumed run picks up exactly
+/// where the previous one was killed.
+/// </para>
+/// <para>
 /// Only the resized pixels are stored — <b>not</b> the colour signature. Fingerprinting a
 /// cell-sized bitmap costs a few thousand pixel reads, so recomputing it every run is free, and it
 /// keeps <c>SignatureGrid</c> out of the cache key entirely. Fewer key dimensions means fewer ways
@@ -34,16 +42,27 @@ namespace gridart.Imaging;
 /// swallowed (logged at debug) and the run proceeds by decoding normally.
 /// </para>
 /// </remarks>
-public sealed class TileCache
+public sealed class TileCache : IDisposable
 {
     private const uint Magic = 0x47524441; // "GRDA"
+
+    /// <summary>
+    /// Starts every record. Appending is not atomic, so a killed process can leave a half-written
+    /// record at the end of the file; the marker lets the reader recognise the tail as garbage
+    /// instead of interpreting whatever bytes follow as a string length.
+    /// </summary>
+    private const uint RecordMarker = 0x54494C45; // "TILE"
 
     /// <summary>
     /// Bump this whenever the produced pixels could change — the resize sampler, the crop mode, the
     /// pixel format, or this file's layout. Stale entries from an older algorithm are then ignored
     /// rather than silently reused.
     /// </summary>
-    private const int FormatVersion = 1;
+    /// <remarks>
+    /// v2 dropped the entry count from the header and added <see cref="RecordMarker"/>, so entries can
+    /// be appended one at a time while tiles load.
+    /// </remarks>
+    private const int FormatVersion = 2;
 
     // Concurrent because tiles are loaded in parallel: TryGet reads while other threads Set. A plain
     // Dictionary read concurrently with a write is undefined behaviour, not merely a lost update.
@@ -51,6 +70,20 @@ public sealed class TileCache
     private readonly string path;
     private readonly int tileSize;
     private readonly ILogger logger;
+
+    // Serialises everything that touches the file. Appends happen from the parallel load loop, so the
+    // writes themselves must not interleave; the lock is held only for one 4 KB-ish record while the
+    // expensive decoding continues on the other threads.
+    private readonly Lock fileLock = new();
+
+    private FileStream? appendStream;
+    private BinaryWriter? appendWriter;
+
+    /// <summary>Length of the last complete record, i.e. where a torn tail begins.</summary>
+    private long validLength;
+    private bool appendsUsable = true;
+    private int appended;
+    private int superseded;
 
     private TileCache(string path, int tileSize, ConcurrentDictionary<string, Entry> entries, ILogger logger)
     {
@@ -62,6 +95,9 @@ public sealed class TileCache
 
     /// <summary>Number of entries loaded from disk.</summary>
     public int LoadedCount { get; private set; }
+
+    /// <summary>Number of entries appended during this run.</summary>
+    public int AppendedCount => Volatile.Read(ref appended);
 
     private readonly record struct Entry(long Length, long LastWriteUtcTicks, byte[] Pixels);
 
@@ -100,13 +136,14 @@ public sealed class TileCache
         {
             if (File.Exists(cachePath))
             {
-                cache.Read(cachePath);
+                cache.validLength = cache.Read(cachePath);
             }
         }
         catch (Exception ex)
         {
             // Truncated or corrupt cache: start clean rather than fail the run.
             entries.Clear();
+            cache.validLength = 0;
             logger.LogDebug(ex, "Ignoring unreadable tile cache at {Path}.", cachePath);
         }
 
@@ -176,101 +213,264 @@ public sealed class TileCache
         }
     }
 
-    /// <summary>Records the resized pixels for a file that had to be decoded.</summary>
+    /// <summary>
+    /// Records the resized pixels for a file that had to be decoded, and appends them to the cache
+    /// file immediately so the work survives an interrupted run.
+    /// </summary>
     public void Set(FileInfo file, Image<Rgba32> resized)
     {
         var pixels = new byte[tileSize * tileSize * 4];
         resized.CopyPixelDataTo(pixels);
 
-        entries[file.FullName] = new Entry(file.Length, file.LastWriteTimeUtc.Ticks, pixels);
+        var entry = new Entry(file.Length, file.LastWriteTimeUtc.Ticks, pixels);
+
+        if (!entries.TryAdd(file.FullName, entry))
+        {
+            // Re-decoded because the old entry was stale. The superseded record is still on disk;
+            // last one wins on read, and the end-of-run save compacts the file.
+            entries[file.FullName] = entry;
+            Interlocked.Increment(ref superseded);
+        }
+
+        Append(file.FullName, entry);
     }
 
     /// <summary>
-    /// Writes the cache, keeping only <paramref name="livePaths"/> so entries for deleted files are
-    /// pruned. Does nothing when the content is unchanged, to avoid rewriting megabytes each run.
+    /// Finalises the cache: prunes entries whose files are gone and compacts records superseded during
+    /// the run. Returns true if the file was rewritten.
     /// </summary>
-    public void Save(IReadOnlyCollection<string> livePaths)
+    /// <remarks>
+    /// Because <see cref="Set"/> already appended every new entry, this is normally a no-op that reads
+    /// and writes nothing — the multi-megabyte write it used to perform now happens incrementally
+    /// during loading.
+    /// </remarks>
+    public bool Save(IReadOnlyCollection<string> livePaths)
     {
-        try
+        lock (fileLock)
         {
-            var live = new HashSet<string>(livePaths, StringComparer.OrdinalIgnoreCase);
-            var stale = entries.Keys.Where(k => !live.Contains(k)).ToArray();
-
-            foreach (var key in stale)
+            try
             {
-                entries.TryRemove(key, out _);
-            }
+                var live = new HashSet<string>(livePaths, StringComparer.OrdinalIgnoreCase);
+                var stale = entries.Keys.Where(k => !live.Contains(k)).ToArray();
 
-            if (stale.Length == 0 && entries.Count == LoadedCount)
+                foreach (var key in stale)
+                {
+                    entries.TryRemove(key, out _);
+                }
+
+                // Nothing to prune, nothing shadowed by a newer record, and every append landed:
+                // the file on disk already says exactly this. Rewriting megabytes would be pure cost.
+                if (stale.Length == 0 && Volatile.Read(ref superseded) == 0 && appendsUsable)
+                {
+                    return false;
+                }
+
+                CloseAppendStream();
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+
+                // Write to a temporary file and move it into place, so a crash or a concurrent run can
+                // never leave a half-written cache behind.
+                var temp = $"{path}.{Environment.ProcessId}.tmp";
+                using (var stream = File.Create(temp))
+                {
+                    Write(stream);
+                }
+
+                File.Move(temp, path, overwrite: true);
+                validLength = new FileInfo(path).Length;
+                Interlocked.Exchange(ref superseded, 0);
+                appendsUsable = true;
+
+                logger.LogDebug("Rewrote the tile cache at {Path} with {Count} entries.", path, entries.Count);
+                return true;
+            }
+            catch (Exception ex)
             {
-                return; // Nothing new and nothing pruned.
+                logger.LogDebug(ex, "Could not save the tile cache to {Path}.", path);
+                return false;
             }
-
-            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-
-            // Write to a temporary file and move it into place, so a crash or a concurrent run can
-            // never leave a half-written cache behind.
-            var temp = $"{path}.{Environment.ProcessId}.tmp";
-            using (var stream = File.Create(temp))
-            {
-                Write(stream);
-            }
-
-            File.Move(temp, path, overwrite: true);
-            logger.LogDebug("Saved {Count} tile cache entries to {Path}.", entries.Count, path);
-        }
-        catch (Exception ex)
-        {
-            logger.LogDebug(ex, "Could not save the tile cache to {Path}.", path);
         }
     }
 
-    private void Read(string cachePath)
+    public void Dispose()
     {
-        using var stream = File.OpenRead(cachePath);
+        lock (fileLock)
+        {
+            CloseAppendStream();
+        }
+    }
+
+    private void Append(string key, in Entry entry)
+    {
+        lock (fileLock)
+        {
+            if (!appendsUsable)
+            {
+                return;
+            }
+
+            try
+            {
+                if (appendWriter is null)
+                {
+                    OpenForAppend();
+                }
+
+                WriteRecord(appendWriter!, key, entry);
+
+                // Flush the managed buffer per record so a killed process loses at most the record in
+                // flight. Not Flush(true): forcing the platter on every tile would cost more than the
+                // decode it is protecting, and a torn tail is already recoverable.
+                appendWriter!.Flush();
+
+                validLength = appendStream!.Position;
+                Interlocked.Increment(ref appended);
+            }
+            catch (Exception ex)
+            {
+                // A read-only cache directory, a full disk, or another process holding the file. The
+                // run continues in memory; the end-of-run Save then attempts one full write.
+                appendsUsable = false;
+                CloseAppendStream();
+                logger.LogDebug(ex, "Could not append to the tile cache at {Path}.", path);
+            }
+        }
+    }
+
+    private void OpenForAppend()
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+
+        // FileShare.Read: a second gridart process must not append into the same file concurrently.
+        // It will fail to open, log at debug, and fall back to writing the whole cache at the end.
+        var stream = new FileStream(
+            path,
+            validLength > 0 ? FileMode.OpenOrCreate : FileMode.Create,
+            FileAccess.ReadWrite,
+            FileShare.Read);
+
+        var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
+
+        try
+        {
+            if (validLength > 0)
+            {
+                // Drop any half-written record left by a killed run before appending after it.
+                stream.SetLength(validLength);
+                stream.Seek(0, SeekOrigin.End);
+            }
+            else
+            {
+                WriteHeader(writer);
+            }
+
+            appendStream = stream;
+            appendWriter = writer;
+        }
+        catch
+        {
+            writer.Dispose();
+            stream.Dispose();
+            throw;
+        }
+    }
+
+    private void CloseAppendStream()
+    {
+        appendWriter?.Dispose();
+        appendStream?.Dispose();
+        appendWriter = null;
+        appendStream = null;
+    }
+
+    /// <summary>
+    /// Reads every complete record and returns the offset just past the last one, so a torn tail can
+    /// be trimmed before the next append.
+    /// </summary>
+    private long Read(string cachePath)
+    {
+        // FileShare.ReadWrite, not File.OpenRead: another gridart process may be appending to this
+        // file right now, and a plain read-share request would collide with its write handle and be
+        // treated as an unusable cache.
+        using var stream = new FileStream(
+            cachePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         using var reader = new BinaryReader(stream, Encoding.UTF8);
 
-        if (reader.ReadUInt32() != Magic ||
+        if (stream.Length < 12 ||
+            reader.ReadUInt32() != Magic ||
             reader.ReadInt32() != FormatVersion ||
             reader.ReadInt32() != tileSize)
         {
-            return;
+            return 0;
         }
 
         var expected = tileSize * tileSize * 4;
-        var count = reader.ReadInt32();
+        var good = stream.Position;
 
-        for (var i = 0; i < count; i++)
+        while (stream.Position < stream.Length)
         {
-            var key = reader.ReadString();
-            var length = reader.ReadInt64();
-            var ticks = reader.ReadInt64();
-            var pixels = reader.ReadBytes(expected);
-
-            if (pixels.Length != expected)
+            try
             {
-                return; // Truncated: keep whatever parsed cleanly so far.
-            }
+                if (reader.ReadUInt32() != RecordMarker)
+                {
+                    break; // Garbage from an interrupted append; everything before it is still good.
+                }
 
-            entries[key] = new Entry(length, ticks, pixels);
+                var key = reader.ReadString();
+                var length = reader.ReadInt64();
+                var ticks = reader.ReadInt64();
+                var pixels = reader.ReadBytes(expected);
+
+                if (pixels.Length != expected)
+                {
+                    break; // Truncated final record.
+                }
+
+                entries[key] = new Entry(length, ticks, pixels);
+                good = stream.Position;
+            }
+            catch (EndOfStreamException)
+            {
+                break;
+            }
         }
+
+        if (good < stream.Length)
+        {
+            logger.LogDebug(
+                "Tile cache {Path} has {Bytes} trailing byte(s) from an interrupted run; they will be dropped.",
+                cachePath, stream.Length - good);
+        }
+
+        return good;
     }
 
     private void Write(Stream stream)
     {
         using var writer = new BinaryWriter(stream, Encoding.UTF8);
 
-        writer.Write(Magic);
-        writer.Write(FormatVersion);
-        writer.Write(tileSize);
-        writer.Write(entries.Count);
+        WriteHeader(writer);
 
         foreach (var (key, entry) in entries)
         {
-            writer.Write(key);
-            writer.Write(entry.Length);
-            writer.Write(entry.LastWriteUtcTicks);
-            writer.Write(entry.Pixels);
+            WriteRecord(writer, key, entry);
         }
+    }
+
+    private void WriteHeader(BinaryWriter writer)
+    {
+        writer.Write(Magic);
+        writer.Write(FormatVersion);
+        writer.Write(tileSize);
+        writer.Flush();
+    }
+
+    private static void WriteRecord(BinaryWriter writer, string key, in Entry entry)
+    {
+        writer.Write(RecordMarker);
+        writer.Write(key);
+        writer.Write(entry.Length);
+        writer.Write(entry.LastWriteUtcTicks);
+        writer.Write(entry.Pixels);
     }
 }
