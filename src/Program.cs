@@ -70,7 +70,7 @@ builder.Logging.AddSimpleConsole(o =>
 {
     o.SingleLine = true;
     o.IncludeScopes = false;
-    o.TimestampFormat = null;
+    // o.TimestampFormat = null;
 });
 
 // Progress goes through ILogger like everything else, so --quiet, log-level filters and any extra

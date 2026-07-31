@@ -18,12 +18,14 @@ the end of every run.
 
 | Path | Purpose |
 | --- | --- |
-| `GridArt.sln` | Solution; both projects are attached to it |
+| `GridArt.slnx` | Solution; both projects are attached to it |
 | `src/gridart.csproj` | The worker (`Microsoft.NET.Sdk.Worker`, net10.0) |
 | `src/Program.cs` | Host wiring, config binding, usage guard |
 | `src/CommandLine.cs` | Positional args, short/long aliases, unknown-switch check, usage text |
 | `src/MosaicOptions.cs` | Every tunable, bound from the `Mosaic` config section |
 | `src/Worker.cs` | Runs one job, saves the output, sets the exit code, stops the host |
+| `src/Progress/IProgressReporter.cs` | Phase-progress abstraction plus the no-op used by `--quiet` and tests |
+| `src/Progress/LoggingProgressReporter.cs` | The only implementation: reports phases through `ILogger` |
 | `src/Imaging/MosaicBuilder.cs` | Grid sizing, cell matching, rendering, colour adjust, quality scoring |
 | `src/Imaging/TileLibrary.cs` | Parallel tile loading, resize + centre-crop, fingerprinting |
 | `src/Imaging/TileCache.cs` | On-disk cache of decoded, cell-sized tile pixels |
@@ -68,6 +70,7 @@ by default, so images in subfolders are included.
 | | `--no-cache` | `NoCache` | false | Skip the decoded-tile cache for this run |
 | | `--cache-dir` | `CacheDirectory` | `%LOCALAPPDATA%\GridArt\cache` | Cache location |
 | | `--clear-cache` | `ClearCache` | false | Delete all cache files before running |
+| `-q` | `--quiet` | `Quiet` | false | Drop the per-phase progress lines; results, warnings and errors still log |
 
 Every option is equally settable as configuration — this is not a parallel parser but the same keys
 the aliases point at, which is how the other sources reach it:
@@ -86,8 +89,8 @@ watch that product.
 ## Commands
 
 ```bash
-dotnet build                      # from the repo root; uses GridArt.sln
-dotnet test                       # xUnit suite, ~1s
+dotnet build                      # from the repo root; uses GridArt.slnx
+dotnet test                       # xUnit suite, ~3s
 dotnet run --project src -- --help
 ```
 
@@ -133,6 +136,38 @@ Rules when touching this code:
 
 The invariant a cache must satisfy is that it changes only speed:
 `Cache_does_not_change_the_output` asserts cold, warm and `--no-cache` runs are byte-identical.
+
+## Progress reporting
+
+A run has long silent stretches (loading 1200 tiles, matching 100k cells), so every phase reports
+through `IProgressReporter`: a start line, throttled interim updates, and a completion line with the
+count, duration and rate.
+
+The phases, in order: `Reading base image`, `Rescaling base image`, `Scanning folder`, `Loading
+tiles`, `Saving tile cache`, `Analysing base image`, `Matching tiles`, `Rendering mosaic`, `Colour
+matching`, `Scoring likeness`, `Saving <file>`.
+
+- **Progress goes through `Microsoft.Extensions.Logging`, never to `Console` directly.** An earlier
+  version drew an in-place `\r` bar on stderr; that was removed. Going through `ILogger` means
+  log-level filters, `--quiet` and any additional provider (file, Seq, OpenTelemetry) apply to
+  progress the same as to everything else, and the output stays intact when redirected to a file.
+  Consequences to preserve: no carriage returns, no cursor control, no ANSI, and one self-contained
+  record per update.
+- **Values are named, not interpolated** — `{Phase}`, `{Current}`, `{Total}`, `{Percent}`,
+  `{Elapsed}` — so a structured sink can query them. Don't repeat a placeholder name within one
+  template; names collide in a structured sink (which is why the rate is `{Rate:N0}/s`, with the unit
+  carried by the neighbouring `{Unit}`).
+- **Interim updates are throttled on time, not on count** (`DefaultUpdateInterval`, 1s). Every update
+  is a real log record, so a 100k-cell phase must produce a handful of lines, not 100k. `Advance`
+  checks `IsEnabled` before doing any formatting work.
+- **`Advance` is called from inside `Parallel.ForEachAsync`** (tile loading), so the counter is
+  `Interlocked` and only the thread that wins a `CompareExchange` on the report timestamp logs.
+- A phase that never calls `Advance` is one indivisible step (decoding a single image); it reports
+  bare elapsed time rather than "0 items". A rate is only quoted once elapsed ≥ 0.1s, where it means
+  something.
+- `Dispose` is idempotent — `TileLibrary` disposes its load phase explicitly *and* via `using`.
+- `--quiet` swaps in `NullProgressReporter`; it silences progress only, not results or warnings.
+  Tests default to it, so `IProgressReporter` is an optional trailing parameter throughout.
 
 ## Conventions that matter here
 
@@ -193,6 +228,12 @@ product claim*, not just that code runs:
 CLI behaviour is tested by launching the built assembly as a real process (`RunCliAsync`), because
 `Program.cs` holds the configuration wiring and is not otherwise injectable. Those tests assert that
 short aliases and `--Mosaic:*` keys produce byte-identical output.
+
+Progress is tested through a `CapturingLogger` fake asserting on the emitted records — level, named
+values and rendered text — rather than on any console side effect. That covers the throttle, the
+percentage, `SetTotal`, concurrent `Advance`, and double `Dispose`. The internal
+`LoggingProgressReporter(ILogger, TimeSpan)` constructor exists so tests can shorten the update
+interval instead of sleeping through it.
 
 When you change matching or rendering, keep those invariants covered. `InternalsVisibleTo` in
 `src/gridart.csproj` exposes internals such as `MosaicBuilder.ResolveGrid` to the test project.
