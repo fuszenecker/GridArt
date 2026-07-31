@@ -47,11 +47,16 @@ public sealed class MosaicOptions
 
     /// <summary>
     /// How strongly each placed tile is tinted toward the colour of the cell it covers.
-    /// 0 leaves tiles untouched (most detail visible up close, weakest likeness from afar);
-    /// 1 replaces them with flat colour. Around 0.3 reads well at both distances.
+    /// 0 leaves tiles untouched, 1 replaces them with flat colour.
     /// </summary>
+    /// <remarks>
+    /// <b>Defaults to 0: a source image's colours are never altered unless explicitly asked for.</b>
+    /// This used to default to 0.35, which silently tinted every tile in every run — the mosaic was
+    /// built from recoloured copies of the photos, not the photos. Tinting is a legitimate thing to
+    /// want, so the option stays, but it is opt-in. Do not give this a non-zero default again.
+    /// </remarks>
     [Range(0d, 1d)]
-    public double ColorAdjustStrength { get; set; } = 0.35;
+    public double ColorAdjustStrength { get; set; }
 
     /// <summary>
     /// How many times one tile image may be placed. 0 means unlimited. Low values force variety but

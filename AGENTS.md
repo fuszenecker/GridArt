@@ -63,10 +63,10 @@ by default, so images in subfolders are included.
 | `-n` | `--tiles-across` | `TilesAcross` | 64 | Tiles along the **longer** axis; the short axis follows the aspect ratio |
 | `-s` | `--tile-size` | `TileSize` | 48 | Pixels per tile — how legible tiles are when zoomed in |
 | `-g` | `--signature-grid` | `SignatureGrid` | 3 | Match patches per axis; 1 = average colour only, >1 also matches structure |
-| `-c` | `--color-adjust` | `ColorAdjustStrength` | 0.35 | 0 = untouched tiles, 1 = exactly the base image |
+| `-c` | `--color-adjust` | `ColorAdjustStrength` | **0 (off)** | 0 = untouched tiles, 1 = exactly the base image |
 | `-r` | `--max-reuse` | `MaxTileReuse` | 0 (unlimited) | Cap on placements per source image |
-| `-d` | `--repeat-distance` | `RepeatAvoidanceRadius` | 2 | Cells that must separate two uses of one image — a hard rule, see below |
-| | `--recursive` | `Recursive` | true | Scan subfolders of the tiles folder |
+| `-d` | `--repeat-distance` | `RepeatAvoidanceRadius` | 2 | Cells that must separate two uses of one image — never relaxed, see below |
+| | `--recursive` | `Recursive` | true | Scan subfolders of the tiles folder; bare, or `--recursive false` |
 | `-f` | `--overwrite` | `Overwrite` | false | Replace an existing output file |
 | | `--no-cache` | `NoCache` | false | Skip the decoded-tile cache for this run |
 | | `--cache-dir` | `CacheDirectory` | `%LOCALAPPDATA%\GridArt\cache` | Cache location |
@@ -85,8 +85,9 @@ Mosaic__TilesAcross=80                # environment variable
 
 The two quality knobs pull against each other: raising `ColorAdjustStrength` or `TilesAcross`
 improves the zoomed-out likeness, while raising `TileSize` and lowering `ColorAdjustStrength`
-improves the zoomed-in detail. Output is roughly `TilesAcross × TileSize` pixels on the long edge —
-watch that product.
+improves the zoomed-in detail. `ColorAdjustStrength` is 0 by default — the likeness comes from
+matching alone unless you ask for tinting. Output is roughly `TilesAcross × TileSize` pixels on the
+long edge — watch that product.
 
 ## Commands
 
@@ -118,10 +119,18 @@ broke that, and all three are fixed — none of them may come back.
 - **`ApplyColorAdjust` preserves the tile's own alpha.** It used to write `byte.MaxValue`, turning a
   transparent PNG tile into a solid block. Only the colour channels are blended, and only in linear
   light.
+- **`ColorAdjustStrength` defaults to 0, and must keep defaulting to 0.** It shipped at 0.35, which
+  tinted every tile of every default run 35% toward the base colour — the mosaic was built from
+  recoloured copies of the photos rather than the photos, and nobody asked for that. Tinting is a
+  legitimate thing to want, so the option stays; it is opt-in. A better-looking likeness is not a
+  reason to give this a non-zero default again.
 
 The end-to-end check that pins all of this: with `-c 0`, **all 10,800** 32×32 blocks of a rendered
 3,000-tile mosaic hash byte-identical to a resized source image, 0 altered. If you touch the resize,
-the render or the adjust, re-run that comparison rather than eyeballing the output.
+the render or the adjust, re-run that comparison rather than eyeballing the output. In the suite,
+`Default_run_reproduces_every_source_image_pixel_for_pixel` is the same assertion in miniature and
+runs on **default options**, so it fails if any of the four defects returns *or* if the default
+strength drifts off 0; `Color_adjustment_is_off_unless_it_is_asked_for` pins the default on its own.
 
 ## Repeat distance is a hard constraint
 
@@ -134,20 +143,39 @@ landed next to itself. Measured on a flat grey 20×20 grid with 300 unique tiles
 produced **1,859 violations at `-d 6`** (and 108 at `-d 4` on an aliased fixture); the exclusion
 version produces **0 at `-d 1`, `-d 2`, `-d 4` and `-d 6`**. Do not reintroduce a scoring penalty here.
 
-- **Relaxation is per cell, and it is reported.** A hard ban can be unsatisfiable — a flat base image
-  with fewer tiles than a neighbourhood has cells has no legal move — so when nothing is admissible the
-  radius shrinks one ring at a time *for that cell only*, and `BuildAsync` logs a warning naming the
-  cell count and the shortfall. Throwing instead would refuse to produce an image at all; relaxing
-  silently is what made the original bug invisible. Keep the warning.
+- **It is never relaxed, for any cell, for any reason.** An earlier version shrank the radius one ring
+  at a time for whichever cells had no legal move and logged a warning about it. That is still
+  repetition: "no repetition" that produces repetitions as long as it mentions them is not the
+  constraint. The relaxation loop is gone. `BuildAsync` instead checks satisfiability *before* placing
+  anything and throws if the folder is too small, naming the number of images that would be enough:
+  `--repeat-distance 3 needs at least 25 distinct image(s) for a 10x10 grid, but only 6 loaded.`
+  Refusing to start is the correct answer; a mosaic that quietly breaks the rule it was given is not.
+- **`MinimumTilesForRepeatDistance(columns, rows, radius)` is exact, not a heuristic.** Cells fill in
+  raster order, so the ban list for any cell is at most `radius` full rows above it (each
+  `2·radius+1` cells wide, clamped to `columns`) plus `radius` cells to its left. One image more than
+  that always leaves a legal choice, which is what makes the check sound enough to throw on. It is
+  necessary *and* sufficient — `Enough_tiles_for_the_computed_minimum_always_succeeds` builds with
+  exactly the stated minimum on a flat base, the worst case, and asserts zero violations. If that test
+  ever throws, the formula undercounts; do not "fix" it by relaxing the radius.
+- **`Assign` throws rather than placing a repeat.** Reaching a cell with no admissible tile after the
+  up-front check means either a `--max-reuse` exhaustion or a bug. Both are errors. There is no
+  fallback branch, and adding one would reintroduce the defect above.
 - **`IsUsedNearby` only scans already-assigned cells** — rows above, plus the current row up to the
   previous column — because raster order means later cells hold nothing yet. That is still symmetric in
   effect: if A rejects B, B was placed first and A moved, so no surviving pair inside the radius is
   equal. It does not need a forward scan; it needs the caller to exclude rather than penalise.
-- **Stages relax constantly and deliberately don't warn.** A preview built from the first 200 tiles
-  cannot honour a radius meant for 20,000, so `StageWriter` discards the out-parameters.
+- **Stages skip rather than relax.** A preview built from the first 200 tiles usually cannot honour a
+  radius meant for 20,000, so `StageWriter` tests the same `MinimumTilesForRepeatDistance` (and the
+  reuse cap) and returns false when the tiles loaded so far are not enough — no stage that run, instead
+  of a stage that violates the rule. Previews start appearing once enough tiles have loaded.
 - Tests assert the guarantee over **every cell pair within the radius**, from the rendered pixels, not
   `DistinctTiles > 1`. The old assertion passed for years against the broken penalty because using two
-  tiles somewhere satisfies it. `Repeat_distance_zero_allows_repeats` pins the other direction.
+  tiles somewhere satisfies it. `Repeat_distance_zero_allows_repeats` pins the other direction, and
+  `Too_few_tiles_fails_instead_of_relaxing_the_repeat_distance` pins the refusal.
+- **Tests that are not about placement opt out explicitly with `RepeatAvoidanceRadius = 0` / `-d 0`.**
+  Small fixtures cannot satisfy the default radius 2 on a 10×10 grid (that needs 13 distinct images),
+  and since the constraint is never relaxed, such a run now fails by design. Opting out is a one-line
+  statement of intent; loosening the constraint to keep fixtures alive is not an option.
 - **Repeat-distance tests must use `CreateDistinctTileFolder`, not `CreateTileFolder`.** The latter
   cycles 8 palette colours × 4 brightness steps, so it only yields 32 distinct appearances and tile 000
   is pixel-identical to tile 032 — two different files that render identically read as a violation the
@@ -191,14 +219,14 @@ stage, and on a short run that means no previews at all.
 
 Decoding a folder of full-size photos and resampling each to cell size is the dominant cost of a run
 and is fully deterministic, so the resized pixels are cached in
-`%LOCALAPPDATA%\GridArt\cache\tiles-<folder-hash>-t<TileSize>-v<FormatVersion>.bin`. Measured on 300
-1200×900 JPEGs: 0.6s cold, 0.2s warm.
+`%LOCALAPPDATA%\GridArt\cache\tiles-<folder-hash>-t<TileSize>-v<FormatVersion>.bin`. Measured on 3,000
+photos at `TileSize=32`: loading takes **502ms** cold and **51ms** warm, for a 12.4 MB cache file.
 
 **Entries are appended as each tile decodes, not collected and written at the end.** With tens of
 thousands of images a cold run takes many minutes, and a single write at the end means a run
 interrupted at minute nine — Ctrl-C, a crash, a full disk — leaves *nothing* and starts from zero next
-time. Verified: killing a 3,000-tile run at 0.3s left an 11.5 MB cache (of 27.8 MB full) that the next
-run reused for exactly 1,241 tiles, producing a mosaic byte-identical to a run from an empty cache.
+time. Verified: a `kill -9` 0.35s into a 3,000-tile run left a 2.9 MB cache (of 12.4 MB full) that the
+next run reused for exactly 717 tiles, producing a mosaic byte-identical to one built from a full cache.
 
 ### The file format (v2)
 
@@ -358,7 +386,14 @@ folder`, `Loading tiles` (with `Stage N from … tile(s)` interleaved), `Finalis
 
 - **Do all colour maths in linear light, never in gamma-encoded sRGB.** Averaging sRGB bytes makes
   every average too dark; `ColorSignature` averages linearly and only converts to CIELAB at the end.
-  Use `ColorMath`, don't hand-roll a conversion.
+  Use `ColorMath`, don't hand-roll a conversion. This applies to resampling as well — see "Never
+  change a source image's colours".
+- **An option is an instruction, not a preference.** `--repeat-distance` is an exclusion rather than a
+  score penalty, `--max-reuse` is honoured by previews as well as the final mosaic, and when a limit
+  genuinely cannot be met the run **fails with a message saying what to change** — it does not produce
+  an image that breaks the rule and mention it in a warning. Any new option gets the same treatment:
+  obey it, or refuse the run. Defaults follow from the same principle: nothing that alters the source
+  images happens unless it was asked for, which is why `ColorAdjustStrength` is 0.
 - **Match perceptually.** Distances are CIELAB ΔE, not RGB Euclidean. Squared ΔE is kept through the
   inner matching loop to avoid square roots; take the root only when reporting.
 - **Derive grid boundaries with scaled integer division** (`i * total / n`), so cells tile the source
@@ -374,6 +409,14 @@ folder`, `Loading tiles` (with `Stage N from … tile(s)` interleaved), `Finalis
   `CommandLine.BuildSwitchMappings`. Without the alias it still works as `--Mosaic:Name=value`, and
   the `Every_option_has_a_long_alias` test fails to remind you. Aliases are the only hand-maintained
   part of the options surface.
+- **Every `bool` option must be listed in `CommandLine.BooleanFlags`.** Adding one to `MosaicOptions`
+  is three edits, not two. `--recursive` was missing from the list, so it fell through to the
+  "`--key value`" branch and swallowed the token after it: `gridart base tiles --recursive -n 120`
+  bound `-n` to `Mosaic:Recursive` and aborted with *Failed to convert configuration value '-n'*.
+  Being on the list still allows `--recursive false` — `Parse` consumes a following token only when
+  `bool.TryParse` accepts it, so a path or the next switch is left alone. That check is exactly
+  `bool.TryParse` and no wider: the binder converts via `TypeDescriptor`, whose bool converter throws
+  `FormatException` on `1` and `0`, so accepting those would consume the token and then kill the run.
 - **Validate unknown switches explicitly.** The configuration provider rejects `-Z=9` but *silently
   discards* `-Z 9`, so a typo would otherwise run with unintended defaults.
   `CommandLine.FindUnknownSwitch` closes that gap and runs before the host is built. Keep its
@@ -407,7 +450,14 @@ product claim*, not just that code runs:
 
 - downscaling the mosaic ("zooming out") lands within a ΔE budget of the downscaled base image,
 - cells retain internal contrast ("zooming in" still shows pictures, not flat colour),
+- a run on **default options** renders every cell byte-identical to a resized source file, so no tint,
+  gamma slip or alpha flattening can creep back in, and the default strength cannot drift off 0,
 - `ColorAdjustStrength = 1` reproduces the base image, confirming the blend endpoints,
+- no two cells within `--repeat-distance` share a tile — asserted per *pair* from the rendered pixels,
+  on a flat base and on a gradient, and at the exact computed minimum tile count,
+- too few images for the requested radius **fails** with a message naming how many are needed, rather
+  than relaxing anything,
+- a bare boolean flag does not swallow the option after it (`--recursive -n 120`),
 - linear-light averaging is verified against a known value (half black + half white → sRGB ~188).
 
 CLI behaviour is tested by launching the built assembly as a real process (`RunCliAsync`), because
@@ -428,6 +478,8 @@ images survivable, and both are asserted as observable behaviour rather than as 
   every entry was already appended;
 - a partial cache from a simulated Ctrl-C is reused *and* yields a mosaic byte-identical to one built
   from an empty cache — present-but-wrong is the failure mode worth catching;
+- `Save` keeps entries when the live-path list arrives relative, which is how the tool is normally
+  invoked and which no absolute-path test could have caught;
 - stages appear during loading at the final dimensions, numbered consecutively from 001 beside the
   output with its extension, are absent at interval 0 or for a run shorter than the interval, do not
   change the final mosaic (byte-for-byte against an unstaged run), and do not break a run when the

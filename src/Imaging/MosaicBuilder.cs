@@ -133,27 +133,26 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                 }
             }
 
+            // Checked before matching starts, not discovered halfway through: "no repetition" is a
+            // requirement, so an impossible one fails immediately with the number of images that would
+            // make it possible. The alternative — quietly shrinking the radius for the awkward cells —
+            // is what made the old build produce repeats it had been told not to.
+            var required = MinimumTilesForRepeatDistance(columns, rows, options.RepeatAvoidanceRadius);
+            if (tiles.Count < required)
+            {
+                throw new InvalidOperationException(
+                    $"--repeat-distance {options.RepeatAvoidanceRadius} needs at least {required:N0} " +
+                    $"distinct image(s) for a {columns}x{rows} grid, but only {tiles.Count:N0} " +
+                    "loaded. Add more images, lower --repeat-distance, or lower --tiles-across.");
+            }
+
             int[] assignment;
-            int relaxedCells;
-            int worstRelaxedRadius;
             using (var phase = progress.Begin("Matching tiles", cellCount, "cells"))
             {
                 assignment = Assign(
                     analysis.CellSignatures, tiles, columns, rows,
                     options.RepeatAvoidanceRadius, options.MaxTileReuse,
-                    out relaxedCells, out worstRelaxedRadius, phase, cancellationToken);
-            }
-
-            if (relaxedCells > 0)
-            {
-                // Say so rather than silently producing adjacent duplicates: the run did not honour what
-                // was asked for, and the fix is more tile images or a smaller grid.
-                logger.LogWarning(
-                    "Repeat distance {Radius} could not be honoured for {Cells:N0} of {Total:N0} cell(s) " +
-                    "(reduced by up to {Shortfall}); {Tiles:N0} tile(s) is too few for this grid. " +
-                    "Add more images or lower --tiles-across.",
-                    options.RepeatAvoidanceRadius, relaxedCells, cellCount, worstRelaxedRadius,
-                    tiles.Count);
+                    phase, cancellationToken);
             }
 
             cancellationToken.ThrowIfCancellationRequested();
@@ -369,10 +368,11 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
     /// <c>-d 1</c> visibly placed a tile next to itself despite being asked not to.
     /// </para>
     /// <para>
-    /// The exclusion can be genuinely unsatisfiable — a flat base image with fewer tiles than a
-    /// neighbourhood has cells has no legal choice at all — so when nothing is admissible the radius is
-    /// relaxed one ring at a time for that single cell, and the caller is told how often that happened.
-    /// Relaxing beats throwing: the alternative is refusing to produce an image at all.
+    /// <b>It is never relaxed.</b> An earlier version shrank the radius for a cell that had no legal
+    /// candidate and merely logged a warning, which meant "no repetition" still produced repetitions.
+    /// A stated limit is either honoured or the run fails saying why — see
+    /// <see cref="MinimumTilesForRepeatDistance"/>, which makes the failure predictable up front rather
+    /// than a surprise thrown from the middle of matching.
     /// </para>
     /// <para>
     /// Use counts are local to the call rather than stored on <see cref="Tile"/>. That keeps the method
@@ -387,8 +387,6 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
         int rows,
         int repeatAvoidanceRadius,
         int maxTileReuse,
-        out int relaxedCells,
-        out int worstRelaxedRadius,
         IProgressPhase? phase = null,
         CancellationToken cancellationToken = default)
     {
@@ -399,9 +397,6 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
         var tileCount = tiles.Count;
         var useCounts = new int[tileCount];
         var reuseCap = maxTileReuse == 0 ? int.MaxValue : maxTileReuse;
-
-        relaxedCells = 0;
-        worstRelaxedRadius = 0;
 
         // Signatures are pulled out of the Tile objects once: the inner loop then walks a flat array
         // instead of dereferencing through an IReadOnlyList on every one of cells × tiles iterations.
@@ -442,60 +437,45 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                 var row = cellIndex / columns;
                 var offset = i * tileCount;
 
+                var bestScore = float.PositiveInfinity;
                 var bestTile = -1;
-                var effectiveRadius = repeatAvoidanceRadius;
 
-                // Shrink the radius only if the requested one admits nothing. At the requested radius
-                // this loop runs exactly once, which is the normal case.
-                while (true)
+                for (var t = 0; t < tileCount; t++)
                 {
-                    var bestScore = float.PositiveInfinity;
-                    bestTile = -1;
-
-                    for (var t = 0; t < tileCount; t++)
+                    if (useCounts[t] >= reuseCap)
                     {
-                        if (useCounts[t] >= reuseCap)
-                        {
-                            continue;
-                        }
-
-                        var score = distances[offset + t];
-                        if (score >= bestScore)
-                        {
-                            // Already losing on colour alone; skip the neighbour scan. Strict '<' also
-                            // makes the lowest tile index win a tie, which keeps a run reproducible.
-                            continue;
-                        }
-
-                        if (effectiveRadius > 0 &&
-                            IsUsedNearby(assignment, columns, col, row, effectiveRadius, t))
-                        {
-                            continue; // Excluded outright — this is what makes -d mean what it says.
-                        }
-
-                        bestScore = score;
-                        bestTile = t;
+                        continue;
                     }
 
-                    if (bestTile >= 0 || effectiveRadius == 0)
+                    var score = distances[offset + t];
+                    if (score >= bestScore)
                     {
-                        break;
+                        // Already losing on colour alone; skip the neighbour scan. Strict '<' also
+                        // makes the lowest tile index win a tie, which keeps a run reproducible.
+                        continue;
                     }
 
-                    effectiveRadius--;
+                    if (repeatAvoidanceRadius > 0 &&
+                        IsUsedNearby(assignment, columns, col, row, repeatAvoidanceRadius, t))
+                    {
+                        continue; // Excluded outright — this is what makes -d mean what it says.
+                    }
+
+                    bestScore = score;
+                    bestTile = t;
                 }
 
                 if (bestTile < 0)
                 {
+                    // No fallback and no relaxation: honouring the radius is the whole point, and the
+                    // caller checked MinimumTilesForRepeatDistance before starting, so reaching this is
+                    // a reuse-cap exhaustion or a bug — either way it must not silently place a repeat.
                     throw new InvalidOperationException(
-                        $"Ran out of usable tiles at cell ({col}, {row}) because every image hit the " +
-                        $"MaxTileReuse limit of {maxTileReuse}.");
-                }
-
-                if (effectiveRadius < repeatAvoidanceRadius)
-                {
-                    relaxedCells++;
-                    worstRelaxedRadius = Math.Max(worstRelaxedRadius, repeatAvoidanceRadius - effectiveRadius);
+                        $"No image can fill cell ({col}, {row}) while honouring --repeat-distance " +
+                        $"{repeatAvoidanceRadius}" +
+                        (maxTileReuse > 0 ? $" and --max-reuse {maxTileReuse}" : string.Empty) +
+                        $" with {tileCount} image(s). Add more images, lower --repeat-distance, " +
+                        "or lower --tiles-across.");
                 }
 
                 assignment[cellIndex] = bestTile;
@@ -506,6 +486,37 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
         }
 
         return assignment;
+    }
+
+    /// <summary>
+    /// How many distinct images are needed before a repeat distance is guaranteed satisfiable.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Cells are filled in raster order, so when a cell is picked the only tiles banned for it are the
+    /// already-assigned ones inside the radius: the <c>radius</c> full rows above (each contributing
+    /// <c>2·radius + 1</c> cells, clamped to the grid width) plus the <c>radius</c> cells to its left.
+    /// That count is the largest possible ban list, so one more image than that always leaves a legal
+    /// choice — whatever the base image looks like and however the earlier cells fell.
+    /// </para>
+    /// <para>
+    /// This is why the radius never has to be relaxed: the run can tell before matching starts whether
+    /// the request is achievable, and say so with a number the user can act on, instead of discovering
+    /// it at cell 40,000 and quietly placing a duplicate.
+    /// </para>
+    /// </remarks>
+    internal static long MinimumTilesForRepeatDistance(int columns, int rows, int radius)
+    {
+        if (radius <= 0)
+        {
+            return 1;
+        }
+
+        var rowsAbove = Math.Min(radius, rows - 1);
+        var perRow = Math.Min(columns, 2L * radius + 1);
+        var leftOfCell = Math.Min(radius, columns - 1);
+
+        return rowsAbove * perRow + leftOfCell + 1;
     }
 
     /// <summary>
@@ -781,11 +792,17 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                     return false;
                 }
 
-                // --max-reuse is a limit, not a hint, so a preview obeys it too. Early on there are
-                // genuinely too few tiles to fill the grid within the cap; that is a reason to wait for
-                // the next stage, not to break the rule.
+                // The limits are limits for previews too. Early on there are genuinely too few tiles to
+                // fill the grid within the reuse cap or to honour the repeat distance; that is a reason
+                // to wait for the next stage, not to break the rule and not to fail the run.
                 if (maxTileReuse > 0 &&
                     (long)tiles.Count * maxTileReuse < (long)analysis.Columns * analysis.Rows)
+                {
+                    return false;
+                }
+
+                if (tiles.Count < MinimumTilesForRepeatDistance(
+                        analysis.Columns, analysis.Rows, repeatAvoidanceRadius))
                 {
                     return false;
                 }
@@ -798,12 +815,10 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
 
                 using (progress.Begin($"Stage {index} from {tiles.Count:N0} tile(s)"))
                 {
-                    // A stage draws from however few tiles have loaded, so the repeat distance is
-                    // relaxed constantly here; that is expected and not worth a warning per preview.
                     var assignment = Assign(
                         analysis.CellSignatures, tiles, analysis.Columns, analysis.Rows,
                         repeatAvoidanceRadius, maxTileReuse,
-                        out _, out _, phase: null, cancellationToken);
+                        phase: null, cancellationToken);
 
                     using var mosaic = Render(
                         assignment, tiles, analysis.Columns, analysis.Rows, tileSize,

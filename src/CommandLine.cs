@@ -18,7 +18,7 @@ public static class CommandLine
           -n, --tiles-across <n>         Tiles along the long axis (default 64)
           -s, --tile-size <px>           Pixels per tile (default 48)
           -g, --signature-grid <n>       Match patches per axis, 1-16 (default 3)
-          -c, --color-adjust <0-1>       Tint toward the base image (default 0.35)
+          -c, --color-adjust <0-1>       Tint tiles toward the base image (default 0 = off)
           -r, --max-reuse <n>            Max placements per image, 0 = unlimited (default 0)
           -d, --repeat-distance <n>      Cells that must separate two uses of one image (default 2)
               --recursive <bool>         Scan subfolders (default true)
@@ -35,9 +35,13 @@ public static class CommandLine
         The cache is keyed on the tiles folder and --tile-size only, so changing any other option
         still hits the cache.
 
-        --repeat-distance is a hard rule, not a preference: no two cells within that many cells of
-        each other get the same image. It is relaxed for a single cell only when no image is left to
-        choose from, and the run warns when that happens — add more images or lower --tiles-across.
+        --repeat-distance is absolute: no two cells within that many cells of each other ever get the
+        same image. It is never relaxed. If the folder holds too few images for the grid, the run
+        fails up front saying how many are needed — add more images, lower --repeat-distance, or
+        lower --tiles-across.
+
+        Source images are reproduced with their own colours. Nothing tints, brightens or recolours a
+        tile unless you pass --color-adjust above 0.
 
         While tiles load, a preview mosaic is written every --stage-interval seconds as
         <output>.stage-NNN.<ext>, so the development is visible on long runs over many images.
@@ -58,11 +62,22 @@ public static class CommandLine
     public static IReadOnlyDictionary<string, string> SwitchMappings { get; } = BuildSwitchMappings();
 
     /// <summary>
-    /// Flags that take no value. The configuration binder needs <c>key=true</c>, so a bare
-    /// <c>--overwrite</c> is expanded before parsing.
+    /// Every switch that binds to a <c>bool</c> property. The configuration binder needs
+    /// <c>key=value</c>, so a bare <c>--overwrite</c> is expanded to <c>--overwrite=true</c> before
+    /// parsing.
     /// </summary>
+    /// <remarks>
+    /// <c>--recursive</c> belongs here even though it is documented as taking a value. It was missing,
+    /// so it fell through to the "--key value" branch and swallowed the following token:
+    /// <c>gridart base tiles --recursive -n 120</c> bound "-n" to Mosaic:Recursive and died with
+    /// "Failed to convert configuration value '-n'". Being in this list does not stop
+    /// <c>--recursive false</c> from working — see <see cref="Parse"/>, which still consumes a
+    /// following token when it actually looks like a boolean.
+    /// </remarks>
     private static readonly string[] BooleanFlags =
-        ["-f", "--overwrite", "--no-cache", "--clear-cache", "-q", "--quiet"];
+    [
+        "-f", "--overwrite", "--no-cache", "--clear-cache", "-q", "--quiet", "--recursive",
+    ];
 
     private static Dictionary<string, string> BuildSwitchMappings()
     {
@@ -121,6 +136,17 @@ public static class CommandLine
             {
                 if (IsBooleanFlag(arg))
                 {
+                    // "--recursive false" is the documented spelling for turning one off, so a
+                    // following token is consumed when — and only when — it actually reads as a
+                    // boolean. Anything else (a path, "-n", the next switch) is left where it is:
+                    // guessing that it belonged to the flag is what made "--recursive -n 120" bind
+                    // "-n" to Mosaic:Recursive and abort the run.
+                    if (i + 1 < args.Length && IsBooleanValue(args[i + 1]))
+                    {
+                        remaining.Add($"{arg}={args[++i]}");
+                        continue;
+                    }
+
                     // The binder needs an explicit value; a bare flag means "true".
                     remaining.Add($"{arg}=true");
                     continue;
@@ -226,6 +252,17 @@ public static class CommandLine
         return arg.Length == name.Length
             && BooleanFlags.Contains(name, StringComparer.OrdinalIgnoreCase);
     }
+
+    /// <summary>
+    /// Whether a token is a value a bool property would accept.
+    /// </summary>
+    /// <remarks>
+    /// Exactly <see cref="bool.TryParse"/>, and deliberately no wider. The configuration binder
+    /// converts through <c>TypeDescriptor</c>, whose bool converter throws a FormatException on "1"
+    /// and "0" — accepting those here would consume the token and then abort the run, which is the
+    /// failure this whole path exists to prevent.
+    /// </remarks>
+    private static bool IsBooleanValue(string arg) => bool.TryParse(arg, out _);
 
     /// <summary>True when the arguments ask for help rather than a mosaic run.</summary>
     public static bool WantsHelp(string[] args) => args.Any(a =>

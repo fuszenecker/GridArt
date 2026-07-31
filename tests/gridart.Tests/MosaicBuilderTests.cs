@@ -103,6 +103,70 @@ public sealed class MosaicBuilderTests : IDisposable
     }
 
     [Fact]
+    public void Color_adjustment_is_off_unless_it_is_asked_for()
+    {
+        // Pinned as its own assertion because the default is the whole guarantee. This shipped as 0.35
+        // for a while, which tinted every tile of every run 35% toward the base colour — the mosaic was
+        // made of recoloured copies of the photos, not the photos. A non-zero default here is a bug no
+        // matter how good it makes the likeness look.
+        Assert.Equal(0d, new MosaicOptions().ColorAdjustStrength);
+    }
+
+    [Fact]
+    public async Task Default_run_reproduces_every_source_image_pixel_for_pixel()
+    {
+        // The end-to-end form of the same guarantee, and the one that would actually catch a regression
+        // anywhere in the pipeline: not just a changed default, but a stray tint, a gamma slip in the
+        // resampler, or an alpha-flattening pass in the renderer. Every rendered cell must be a
+        // byte-exact copy of some source file scaled to cell size — nothing in between.
+        var basePath = CreateGradientImage("fidelity-base.png", 320, 320);
+        var tiles = CreateTileFolder("fidelity-tiles", 40);
+
+        using var result = await BuildAsync(new MosaicOptions
+        {
+            BaseImage = basePath,
+            TilesFolder = tiles,
+            TilesAcross = 10,
+            TileSize = 16,
+
+            // ColorAdjustStrength and RepeatAvoidanceRadius are deliberately left at their defaults:
+            // this test is about what an ordinary invocation does, so setting them would defeat it.
+        });
+
+        // What a faithful tile looks like: the source file resized exactly the way TileLibrary does it.
+        var expected = new HashSet<string>();
+        foreach (var file in Directory.GetFiles(tiles))
+        {
+            using var source = await Image.LoadAsync<Rgba32>(file);
+            source.Mutate(ctx => ctx.Resize(new ResizeOptions
+            {
+                Size = new Size(16, 16),
+                Mode = ResizeMode.Crop,
+                Position = AnchorPositionMode.Center,
+                Sampler = KnownResamplers.Lanczos3,
+                Compand = true,
+            }));
+
+            expected.Add(CellFingerprint(source, source.Bounds));
+        }
+
+        var altered = 0;
+        for (var row = 0; row < result.Rows; row++)
+        {
+            for (var col = 0; col < result.Columns; col++)
+            {
+                var cell = new Rectangle(col * 16, row * 16, 16, 16);
+                if (!expected.Contains(CellFingerprint(result.Image, cell)))
+                {
+                    altered++;
+                }
+            }
+        }
+
+        Assert.Equal(0, altered);
+    }
+
+    [Fact]
     public async Task Color_adjust_at_full_strength_reproduces_the_base_image()
     {
         var basePath = CreateQuadrantBaseImage("base.png", 320, 320);
@@ -234,14 +298,16 @@ public sealed class MosaicBuilderTests : IDisposable
     }
 
     [Fact]
-    public async Task Too_few_tiles_relaxes_the_repeat_distance_instead_of_failing()
+    public async Task Too_few_tiles_fails_instead_of_relaxing_the_repeat_distance()
     {
-        // A radius of 3 needs ~24 already-placed neighbours to differ; with 6 tiles that is impossible.
-        // Producing an image and warning beats throwing, but it must still be an image.
+        // A radius of 3 needs 25 distinct images for this grid; with 6 it cannot be done. The build
+        // used to shrink the radius for the awkward cells and merely warn, which meant "no repetition"
+        // produced repetitions. Refusing is the correct answer, and the message must say how many
+        // images would be enough.
         var basePath = CreateSolidImage("cramped.png", 160, 160, new Rgba32(120, 120, 120));
         var tiles = CreateDistinctTileFolder("cramped-tiles", 6);
 
-        using var result = await BuildAsync(new MosaicOptions
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => BuildAsync(new MosaicOptions
         {
             BaseImage = basePath,
             TilesFolder = tiles,
@@ -249,14 +315,35 @@ public sealed class MosaicBuilderTests : IDisposable
             TileSize = 8,
             RepeatAvoidanceRadius = 3,
             ColorAdjustStrength = 0d,
+        }));
+
+        Assert.Contains("25", error.Message);
+        Assert.Contains("--repeat-distance", error.Message);
+    }
+
+    [Fact]
+    public async Task Enough_tiles_for_the_computed_minimum_always_succeeds()
+    {
+        // The other half of the contract: the stated minimum must be sufficient, not merely necessary,
+        // on the worst possible input — a flat image, where every cell wants the same tile and only the
+        // exclusion forces variety. If this ever throws, MinimumTilesForRepeatDistance undercounts.
+        var required = MosaicBuilder.MinimumTilesForRepeatDistance(10, 10, 2);
+        Assert.Equal(13, required);
+
+        var basePath = CreateSolidImage("exact.png", 160, 160, new Rgba32(120, 120, 120));
+        var tiles = CreateDistinctTileFolder("exact-tiles", (int)required);
+
+        using var result = await BuildAsync(new MosaicOptions
+        {
+            BaseImage = basePath,
+            TilesFolder = tiles,
+            TilesAcross = 10,
+            TileSize = 8,
+            RepeatAvoidanceRadius = 2,
+            ColorAdjustStrength = 0d,
         });
 
-        Assert.Equal(10, result.Columns);
-        Assert.Equal(10, result.Rows);
-
-        // Even when relaxed, it must still do as well as the tile count allows: 6 tiles cannot repeat
-        // inside a radius of 1 either, but they can and must all be used.
-        Assert.Equal(6, result.Quality.DistinctTiles);
+        AssertNoRepeatWithinRadius(result, 2);
     }
 
     /// <summary>
@@ -373,6 +460,10 @@ public sealed class MosaicBuilderTests : IDisposable
             TilesFolder = tiles,
             TilesAcross = 6,
             TileSize = 8,
+
+            // This test is about skipping unreadable files, not placement; 8 tiles cannot satisfy the
+            // default repeat distance on a 6x6 grid, and that constraint is never relaxed.
+            RepeatAvoidanceRadius = 0,
         });
 
         Assert.Equal(6, result.Columns);
@@ -429,6 +520,34 @@ public sealed class MosaicBuilderTests : IDisposable
         // An explicit value must survive untouched.
         var (_, explicitValue) = CommandLine.Parse(["base.png", "tiles", "--overwrite=false"]);
         Assert.Equal(["--overwrite=false"], explicitValue);
+    }
+
+    [Fact]
+    public void A_boolean_flag_does_not_swallow_the_option_that_follows_it()
+    {
+        // The bug: --recursive was documented as "--recursive <bool>" but was not on the boolean-flag
+        // list, so it took the "--key value" path and consumed whatever came next. A real invocation,
+        // "gridart base tiles --recursive -n 120", bound "-n" to Mosaic:Recursive and aborted with
+        // "Failed to convert configuration value '-n' at 'Mosaic:Recursive'".
+        var (positional, remaining) = CommandLine.Parse(
+            ["base.png", "tiles", "--recursive", "-n", "120"]);
+
+        Assert.Equal(["--recursive=true", "-n", "120"], remaining);
+        Assert.Equal("tiles", positional["Mosaic:TilesFolder"]);
+    }
+
+    [Fact]
+    public void A_boolean_flag_still_takes_a_space_separated_true_or_false()
+    {
+        // The other half: "--recursive false" is the documented way to switch subfolder scanning off,
+        // and it has to keep working now that a bare --recursive is self-contained.
+        var (_, remaining) = CommandLine.Parse(["base.png", "tiles", "--recursive", "false"]);
+        Assert.Equal(["--recursive=false"], remaining);
+
+        // Nothing else is consumed — a following path stays a positional argument, not a bool value.
+        var (positional, _) = CommandLine.Parse(["--recursive", "base.png", "tiles"]);
+        Assert.Equal("base.png", positional["Mosaic:BaseImage"]);
+        Assert.Equal("tiles", positional["Mosaic:TilesFolder"]);
     }
 
     [Theory]
@@ -516,7 +635,9 @@ public sealed class MosaicBuilderTests : IDisposable
         Assert.Null(CommandLine.FindUnknownSwitch([rootedBase, rootedTiles]));
 
         var output = Path.Combine(root, "rooted.png");
-        var exitCode = await RunCliAsync([rootedBase, rootedTiles, "-n", "8", "-s", "8", "-o", output, "-f"]);
+        // -d 0: this is about path handling, and 10 tiles cannot satisfy the default repeat distance.
+        var exitCode = await RunCliAsync(
+            [rootedBase, rootedTiles, "-n", "8", "-s", "8", "-o", output, "-f", "-d", "0"]);
 
         Assert.Equal(0, exitCode);
         Assert.True(File.Exists(output), "A slash-prefixed path should have produced a mosaic.");
@@ -808,6 +929,11 @@ public sealed class MosaicBuilderTests : IDisposable
             TileSize = tileSize,
             CacheDirectory = cacheDir,
             NoCache = noCache,
+
+            // Cache tests use a dozen tiles, well under what an absolute repeat distance needs for a
+            // 10x10 grid. Opted out explicitly because the constraint is never relaxed for anyone —
+            // a test that does not care about placement has to say so.
+            RepeatAvoidanceRadius = 0,
         });
 
         using var stream = new MemoryStream();
@@ -830,7 +956,8 @@ public sealed class MosaicBuilderTests : IDisposable
         var tiles = CreateTileFolder("tiles", 12);
         var output = Path.Combine(root, "aliased.png");
 
-        var exitCode = await RunCliAsync([basePath, tiles, "-n", "12", "-s", "8", "-o", output, "-f"]);
+        // -d 0: this asserts alias plumbing, and 12 tiles cannot satisfy the default repeat distance.
+        var exitCode = await RunCliAsync([basePath, tiles, "-n", "12", "-s", "8", "-o", output, "-f", "-d", "0"]);
 
         Assert.Equal(0, exitCode);
         Assert.True(File.Exists(output), "The -o alias should have produced this file.");
@@ -848,11 +975,15 @@ public sealed class MosaicBuilderTests : IDisposable
         var viaAlias = Path.Combine(root, "alias.png");
         var viaConfigKey = Path.Combine(root, "config.png");
 
+        // Repeat distance off on both sides: 12 tiles cannot satisfy the default, and what is under
+        // test is that the two spellings reach the same options, not how tiles are placed.
         Assert.Equal(0, await RunCliAsync(
-            [basePath, tiles, "--tiles-across", "10", "--tile-size", "8", "--output", viaAlias, "-f"]));
+            [basePath, tiles, "--tiles-across", "10", "--tile-size", "8", "--output", viaAlias, "-f",
+             "--repeat-distance", "0"]));
         Assert.Equal(0, await RunCliAsync(
             [basePath, tiles, "--Mosaic:TilesAcross=10", "--Mosaic:TileSize=8",
-             $"--Mosaic:OutputPath={viaConfigKey}", "--Mosaic:Overwrite=true"]));
+             $"--Mosaic:OutputPath={viaConfigKey}", "--Mosaic:Overwrite=true",
+             "--Mosaic:RepeatAvoidanceRadius=0"]));
 
         Assert.Equal(await File.ReadAllBytesAsync(viaAlias), await File.ReadAllBytesAsync(viaConfigKey));
     }

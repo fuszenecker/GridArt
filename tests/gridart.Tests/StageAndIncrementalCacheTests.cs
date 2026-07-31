@@ -335,8 +335,11 @@ public sealed class StageAndIncrementalCacheTests : IDisposable
         var tiles = CreateTileFolder("tiles", 12);
         var output = Path.Combine(root, "cli.png");
 
+        // -d 0: this asserts the --stage-interval mapping, and 12 tiles cannot satisfy the default
+        // repeat distance on a 10x10 grid.
         var exitCode = await RunCliAsync(
-            [basePath, tiles, "-n", "10", "-s", "8", "-o", output, "-f", "--stage-interval", "0"]);
+            [basePath, tiles, "-n", "10", "-s", "8", "-o", output, "-f", "--stage-interval", "0",
+             "-d", "0"]);
 
         Assert.Equal(0, exitCode);
         Assert.True(File.Exists(output));
@@ -428,6 +431,12 @@ public sealed class StageAndIncrementalCacheTests : IDisposable
             CacheDirectory = cacheDir,
             NoCache = noCache,
             StageIntervalSeconds = stageInterval,
+
+            // These fixtures are about caching and stages, not placement, and some use as few as 8
+            // tiles — far below what an absolute repeat distance needs for a 10x10 grid. Set to 0
+            // deliberately: the constraint is not relaxed for anyone, so a test that does not care
+            // about it has to say so rather than quietly get a weaker version of it.
+            RepeatAvoidanceRadius = 0,
         };
 
         return await new MosaicBuilder(NullLogger<MosaicBuilder>.Instance)
