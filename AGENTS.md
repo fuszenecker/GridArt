@@ -132,10 +132,11 @@ should stop you.
   output proportions can read them off one cell.
 - **The cache key is the cell's width *and* height** (`FormatVersion` 3) — see "The tile cache".
 
-## No image is reused unless reuse is asked for
+## No image is reused unless there aren't enough
 
 `-r` / `MaxTileReuse` **defaults to 1: each source image is placed at most once.** 0 means unlimited,
-N caps it at N.
+N caps it at N. **If the folder holds too few images to fill the grid, the cap is raised to the minimum
+that covers it and the run warns — it does not refuse.**
 
 It defaulted to 0 — unlimited — so an ordinary run reused images heavily and admitted it only in a
 statistic nobody reads: 3,000 photos over a 120×90 grid produced **"715 distinct tile(s)" for 10,800
@@ -148,17 +149,31 @@ the default.
   its twin and permits one anywhere outside the radius. With the default `-r 1` it forbids nothing
   extra; it earns its keep only once reuse is allowed with `-r 0` or `-r N`. Never present the radius as
   a no-reuse guarantee.
-- **Too few images fails up front, and the message names a grid that fits.** `n × n` cells need `n²`
-  images without reuse, so the default 64 needs 4,096:
-  `A 20x15 grid needs 300 cells, but with each image is used at most once (--max-reuse 1, the default)
-  the 32 image(s) loaded can fill only 32. Add more images, lower --tiles-across (about 6 would fit),
-  raise --max-reuse, or pass --max-reuse 0 to allow unlimited reuse.` `LargestGridWithin` computes that
-  suggestion; it starts from `√capacity` and walks down rather than scanning from `tileCount`.
-- **Report reuse in words, not only as `DistinctTiles`.** A count that happens to be lower than the
-  cell count *is* the reuse, and a summary line is where a user would notice.
-- **Tests that are not about placement opt out explicitly with `MaxTileReuse = 0` / `-r 0`**, exactly
-  as they do for the radius. Fixtures with a dozen tiles cannot fill a 10×10 grid once each, and the cap
-  is never relaxed for anyone.
+- **A short folder reuses images rather than refusing to draw — showing a result beats avoiding
+  reuse.** This is the one limit that is *not* absolute, and it is a deliberate exception to "an option
+  is an instruction": with tens of thousands of files, "add more images and start over" can mean a run
+  that never produces anything. `ResolveEffectiveReuse` raises the cap and the run continues. It used to
+  throw.
+- **The cap is raised to `ceil(cells / images)` — the smallest value that covers the grid, never to
+  unlimited.** `MinimumReuseFor` is the pure arithmetic, pinned by a table test. 4,500 photos over 6,400
+  cells becomes a cap of 2, not 0: almost every photo still appears once. Unlimited reuse is what
+  produced "715 distinct tiles for 10,800 cells", and the distinction between "reuse when you must" and
+  "reuse without limit" is the entire reason this returns a number.
+- **Every raised cap is reported at warning level, naming the shortfall and the new cap.** A fallback
+  that happened quietly would be the old defect wearing a new hat: it is acceptable *only* because it is
+  stated in words every time. The warning also admits what the number does not promise — matching is
+  greedy, so some images go unused while others hit the cap (4,500 photos over 6,400 cells yields ~3,270
+  distinct, not 3,200).
+- **Report reuse in words in the final summary too.** `Mosaic built … 3,270 distinct tile(s) for 6,400
+  cells (3,130 cell(s) reuse an image already placed)` — a bare `DistinctTiles` count *is* the reuse, and
+  a count is not a sentence.
+- **Stages raise the cap silently (debug, not warning).** A preview from the first 200 tiles must reuse
+  them heavily, and that is the point of stages; warning on every one would bury the final mosaic's
+  warning, which is the one that means something. Stages still skip for the repeat distance, which needs
+  very few images.
+- **Tests that are not about placement may still pass `MaxTileReuse = 0` / `-r 0`.** No longer
+  load-bearing now that the builder raises the cap itself, but it keeps a fixture's output independent
+  of whatever the fallback computes, and it states the intent outright.
 
 ## Never change a source image's colours
 
@@ -458,12 +473,16 @@ folder`, `Loading tiles` (with `Stage N from … tile(s)` interleaved), `Finalis
   Use `ColorMath`, don't hand-roll a conversion. This applies to resampling as well — see "Never
   change a source image's colours".
 - **An option is an instruction, not a preference.** `--repeat-distance` is an exclusion rather than a
-  score penalty, `--max-reuse` is honoured by previews as well as the final mosaic, and when a limit
-  genuinely cannot be met the run **fails with a message saying what to change** — it does not produce
-  an image that breaks the rule and mention it in a warning. Any new option gets the same treatment:
-  obey it, or refuse the run. Defaults follow from the same principle: nothing that alters the source
-  images happens unless it was asked for, which is why `ColorAdjustStrength` is 0 and `MaxTileReuse`
-  is 1.
+  score penalty, not a term in the score, and when it cannot be met the run **fails with a message
+  saying what to change** — it does not produce an image that breaks the rule and mention it in a
+  warning. Defaults follow from the same principle: nothing that alters the source images happens unless
+  it was asked for, which is why `ColorAdjustStrength` is 0 and `MaxTileReuse` is 1.
+- **`--max-reuse` is the one documented exception, because refusing to draw is itself a failure.** A
+  folder too small for the grid gets a raised cap and a warning rather than an error: on a run over tens
+  of thousands of files, "add more images and start over" costs more than the reuse does. The exception
+  is narrow and stays narrow — the cap goes up by the *minimum* that covers the grid, and the run says so
+  every time. Colour fidelity has no such exception: there is no result worth showing that misrepresents
+  the source photos.
 - **A default is a promise about the obvious reading of the request.** Both defaults that shipped wrong
   — a 0.35 tint and unlimited reuse — were defensible as *pictures* and indefensible as *answers to
   what was asked*: build a mosaic out of these photos, not out of recoloured copies of a seventh of

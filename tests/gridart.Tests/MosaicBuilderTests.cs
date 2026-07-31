@@ -1,5 +1,6 @@
 using gridart;
 using gridart.Imaging;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
@@ -476,10 +477,14 @@ public sealed class MosaicBuilderTests : IDisposable
     }
 
     [Fact]
-    public async Task Max_tile_reuse_is_respected_and_reported_when_impossible()
+    public async Task Too_few_images_reuses_them_rather_than_refusing_to_draw()
     {
+        // A short folder used to throw: "no reuse" is the default and a limit is an instruction. Seeing
+        // a result matters more than avoiding reuse when the alternative is seeing nothing, so the cap
+        // is raised instead — but only to the smallest value that covers the grid, and it says so.
         var basePath = CreateQuadrantBaseImage("base.png", 200, 200);
         var tiles = CreateTileFolder("few", 4);
+        var logger = new WarningCollector();
 
         var options = new MosaicOptions
         {
@@ -488,17 +493,40 @@ public sealed class MosaicBuilderTests : IDisposable
             TilesAcross = 10, // 100 cells against 4 tiles x 1 use
             TileSize = 8,
             MaxTileReuse = 1,
-            RepeatAvoidanceRadius = 0, // the reuse cap is what must fail here, not the radius
+            RepeatAvoidanceRadius = 0, // the reuse cap is the subject here, not the radius
         };
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => BuildAsync(options));
+        using var result = await BuildAsync(options, logger);
 
-        // The message has to be actionable, which means naming the shortfall and a --tiles-across that
-        // would actually fit. "MaxTileReuse exceeded" tells the user nothing they can do.
-        Assert.Contains("100", ex.Message);
-        Assert.Contains("4 image(s)", ex.Message);
-        Assert.Contains("--tiles-across", ex.Message);
-        Assert.Contains("--max-reuse 0", ex.Message);
+        // A mosaic, not an exception.
+        Assert.Equal(10, result.Columns);
+        Assert.Equal(10, result.Rows);
+
+        // 100 cells over 4 images is 25 uses each: the ceiling, not unlimited.
+        Assert.Equal(25, MosaicBuilder.MinimumReuseFor(1, 4, 100));
+
+        // And the run says so in words. A raised cap that went unmentioned would be the old defect
+        // wearing a new hat — the fallback is acceptable only because it is always reported.
+        var warning = Assert.Single(logger.Warnings);
+        Assert.Contains("100", warning);
+        Assert.Contains("4 image(s)", warning);
+        Assert.Contains("--tiles-across", warning);
+    }
+
+    [Theory]
+    [InlineData(1, 4, 100, 25)]   // 100 cells, 4 images, no reuse asked: 25 each
+    [InlineData(1, 4500, 6400, 2)] // the real case: 4,500 photos over 6,400 cells needs only 2
+    [InlineData(1, 100, 100, 1)]   // exactly enough: the requested cap stands
+    [InlineData(1, 200, 100, 1)]   // more than enough: unchanged
+    [InlineData(3, 10, 100, 10)]   // an explicit cap is raised on the same terms
+    [InlineData(0, 4, 100, 0)]     // already unlimited: nothing to resolve
+    public void The_reuse_cap_is_raised_only_to_what_covers_the_grid(
+        int requested, int tiles, long cells, int expected)
+    {
+        // Pinned as a table because the number is the whole promise: "reuse when you must" must not
+        // quietly become "reuse without limit", which is what produced 715 distinct tiles for 10,800
+        // cells. Ceiling division, never more.
+        Assert.Equal(expected, MosaicBuilder.MinimumReuseFor(requested, tiles, cells));
     }
 
     [Fact]
@@ -1075,8 +1103,10 @@ public sealed class MosaicBuilderTests : IDisposable
             // a test that does not care about placement has to say so.
             RepeatAvoidanceRadius = 0,
 
-            // Same for the no-reuse default: 12 tiles cannot cover 100 cells once each. These
-            // fixtures are about what the cache stores and returns, not about placement.
+            // 12 tiles cannot cover 100 cells once each. The builder would now raise the cap by itself
+            // and warn, so this is no longer load-bearing — it is kept to say outright that these
+            // fixtures are about what the cache stores and returns, and to keep the output independent
+            // of whatever the fallback happens to compute.
             MaxTileReuse = 0,
         });
 
@@ -1233,6 +1263,49 @@ public sealed class MosaicBuilderTests : IDisposable
 
     private static async Task<MosaicResult> BuildAsync(MosaicOptions options) =>
         await new MosaicBuilder(NullLogger<MosaicBuilder>.Instance).BuildAsync(options, CancellationToken.None);
+
+    private static async Task<MosaicResult> BuildAsync(MosaicOptions options, ILogger<MosaicBuilder> logger) =>
+        await new MosaicBuilder(logger).BuildAsync(options, CancellationToken.None);
+
+    /// <summary>
+    /// Collects warnings so a test can assert that a fallback was *reported*, not merely applied.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately minimal: only the rendered message and the level, because that is all the reuse
+    /// fallback needs to prove. Progress-reporting tests have their own richer capturing logger that
+    /// also keeps the named values.
+    /// </remarks>
+    private sealed class WarningCollector : ILogger<MosaicBuilder>
+    {
+        private readonly List<string> warnings = [];
+
+        public IReadOnlyList<string> Warnings
+        {
+            get { lock (warnings) { return warnings.ToArray(); } }
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel < LogLevel.Warning)
+            {
+                return;
+            }
+
+            lock (warnings)
+            {
+                warnings.Add(formatter(state, exception));
+            }
+        }
+    }
 
     /// <summary>Four saturated quadrants — an easy but unambiguous likeness target.</summary>
     private string CreateQuadrantBaseImage(string name, int width, int height)

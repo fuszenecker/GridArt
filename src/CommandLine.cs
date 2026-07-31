@@ -19,7 +19,8 @@ public static class CommandLine
           -s, --tile-size <px>           Pixels along a tile's longer edge (default 48)
           -g, --signature-grid <n>       Match patches per axis, 1-16 (default 3)
           -c, --color-adjust <0-1>       Tint tiles toward the base image (default 0 = off)
-          -r, --max-reuse <n>            Max placements per image, 0 = unlimited (default 1)
+          -r, --max-reuse <n>            Max placements per image; raised if too few images to fill
+                                         the grid, 0 = unlimited (default 1)
           -d, --repeat-distance <n>      Cells that must separate two uses of one image (default 2)
               --recursive <bool>         Scan subfolders (default true)
           -f, --overwrite                Replace an existing output file
@@ -40,10 +41,12 @@ public static class CommandLine
         measures (n x cell width) by (n x cell height), so base-shaped cells on a square grid are what
         make the mosaic itself base-shaped. Square tiles would centre-crop every photo to a square.
 
-        No image is reused by default (--max-reuse 1), so the folder needs at least as many images as
-        the grid has cells: 64 x 64 is 4,096 photos. A folder that is too small fails up front, saying
-        what would fit — it never quietly places the same photo twice. --max-reuse 0 allows unlimited
-        reuse, --max-reuse N caps it at N.
+        No image is reused by default (--max-reuse 1), so one photo per cell needs at least as many
+        images as the grid has cells: 64 x 64 is 4,096 photos. If the folder holds fewer, the cap is
+        raised to the smallest number that still fills the grid and the run warns — seeing a mosaic
+        beats refusing to draw one. It is never raised further than that, so 4,500 photos over 6,400
+        cells means at most two uses each, not unlimited. --max-reuse 0 allows unlimited reuse,
+        --max-reuse N caps it at N.
 
         --repeat-distance is absolute: no two cells within that many cells of each other ever get the
         same image. It is never relaxed. If the folder holds too few images for the grid, the run

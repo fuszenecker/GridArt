@@ -87,9 +87,14 @@ public sealed class MosaicOptions
     /// </para>
     /// <para>
     /// "Do not reuse an image" is the obvious reading of a photomosaic built from a folder of photos, so
-    /// it is the default. It requires at least as many images as the grid has cells, and the run says so
-    /// up front when the folder is too small rather than silently reusing. Pass <c>-r 0</c> to allow
-    /// unlimited reuse, or <c>-r N</c> to cap it at N.
+    /// it is the default. Pass <c>-r 0</c> to allow unlimited reuse, or <c>-r N</c> to cap it at N.
+    /// </para>
+    /// <para>
+    /// <b>This cap is raised rather than enforced when the folder is too small to fill the grid.</b>
+    /// Refusing to draw anything is itself a failure — on a run over tens of thousands of files, "add
+    /// more images and start over" costs more than the reuse does. <c>MosaicBuilder.ResolveEffectiveReuse</c>
+    /// raises it to <c>ceil(cells / images)</c>, the least reuse that covers the grid, and warns. It is
+    /// the only limit here that bends, and it bends by the minimum.
     /// </para>
     /// </remarks>
     [Range(0, int.MaxValue)]

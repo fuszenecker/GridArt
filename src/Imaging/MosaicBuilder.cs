@@ -105,7 +105,7 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                 ? null
                 : TileCache.Open(options.CacheDirectory, options.TilesFolder, cellSize, logger);
 
-            var stages = StageWriter.Create(options, baseTask, cellSize, logger, progress);
+            var stages = StageWriter.Create(options, baseTask, cellSize, baseSize, logger, progress);
 
             var libraryTask = TileLibrary.LoadAsync(
                 options.TilesFolder,
@@ -139,25 +139,8 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
 
             var tiles = library!.Tiles;
 
-            if (options.MaxTileReuse > 0)
-            {
-                var capacity = (long)tiles.Count * options.MaxTileReuse;
-                if (capacity < cellCount)
-                {
-                    // Phrased for the default case first, because that is the one people hit: "no reuse"
-                    // simply needs one image per cell, and the fix is usually a smaller --tiles-across
-                    // rather than more photos.
-                    var limit = options.MaxTileReuse == 1
-                        ? "each image is used at most once (--max-reuse 1, the default)"
-                        : $"--max-reuse {options.MaxTileReuse}";
-
-                    throw new InvalidOperationException(
-                        $"A {columns}x{rows} grid needs {cellCount:N0} cells, but with {limit} the " +
-                        $"{tiles.Count:N0} image(s) loaded can fill only {capacity:N0}. Add more images, " +
-                        $"lower --tiles-across (about {LargestGridWithin(baseSize, tiles.Count, options.MaxTileReuse)} " +
-                        "would fit), raise --max-reuse, or pass --max-reuse 0 to allow unlimited reuse.");
-                }
-            }
+            var effectiveReuse = ResolveEffectiveReuse(
+                options.MaxTileReuse, tiles.Count, cellCount, columns, rows, baseSize, logger);
 
             // Checked before matching starts, not discovered halfway through: "no repetition" is a
             // requirement, so an impossible one fails immediately with the number of images that would
@@ -179,7 +162,7 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                 // throwing, so both tasks completed and the finally assigned both.
                 assignment = Assign(
                     analysis!.CellSignatures, tiles, columns, rows,
-                    options.RepeatAvoidanceRadius, options.MaxTileReuse,
+                    options.RepeatAvoidanceRadius, effectiveReuse,
                     phase, cancellationToken);
             }
 
@@ -209,9 +192,18 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                         phase, cancellationToken);
                 }
 
+                // Reuse is stated in words, not left to be inferred from DistinctTiles. "715 distinct
+                // tile(s)" was a truthful report of every image being used fifteen times over that nobody
+                // could be expected to read as one; a count is not a sentence.
+                var reuseNote = quality.DistinctTiles >= cellCount
+                    ? "every cell a different image"
+                    : $"{cellCount - quality.DistinctTiles:N0} cell(s) reuse an image already placed";
+
                 logger.LogInformation(
-                    "Mosaic built in {Elapsed:0.0}s — mean ΔE {Mean:0.00}, p95 ΔE {P95:0.00}, worst ΔE {Worst:0.00}, {Distinct} distinct tile(s).",
-                    stopwatch.Elapsed.TotalSeconds, quality.MeanDeltaE, quality.P95DeltaE, quality.WorstDeltaE, quality.DistinctTiles);
+                    "Mosaic built in {Elapsed:0.0}s — mean ΔE {Mean:0.00}, p95 ΔE {P95:0.00}, worst ΔE {Worst:0.00}, " +
+                    "{Distinct:N0} distinct tile(s) for {Cells:N0} cells ({ReuseNote}).",
+                    stopwatch.Elapsed.TotalSeconds, quality.MeanDeltaE, quality.P95DeltaE, quality.WorstDeltaE,
+                    quality.DistinctTiles, cellCount, reuseNote);
 
                 return new MosaicResult(mosaic, columns, rows, quality);
             }
@@ -566,6 +558,77 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
     }
 
     /// <summary>
+    /// The reuse cap actually used for a run: the requested one when the folder can satisfy it, or the
+    /// smallest cap that fills the grid when it cannot.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>A short folder produces a mosaic rather than a refusal, and reuse is the fallback.</b> This
+    /// used to throw: "no reuse" is the default and a limit is an instruction, so an unsatisfiable one
+    /// failed up front. Seeing a result matters more than avoiding reuse when the alternative is seeing
+    /// nothing at all — with tens of thousands of files, "add more images" can mean a run that never
+    /// completes.
+    /// </para>
+    /// <para>
+    /// It raises the cap to <c>ceil(cells / images)</c>, which is the <i>least</i> reuse that can cover
+    /// the grid — not unlimited. 4,000 images over 4,096 cells means a cap of 2, so almost every photo
+    /// still appears once and no photo appears fifteen times. Unlimited reuse is what produced "715
+    /// distinct tiles for 10,800 cells"; a computed minimum is a different thing, and the distinction is
+    /// the whole reason this returns a number instead of 0.
+    /// </para>
+    /// <para>
+    /// It is reported at warning level, naming the shortfall and the cap. A run that quietly did
+    /// something it was told not to would be the old defect wearing a new hat: the fallback is
+    /// acceptable only because it is stated in words every time it happens.
+    /// </para>
+    /// <para>
+    /// An explicit <c>--max-reuse N</c> is raised on the same terms. The reading that matters is "fill
+    /// the grid", and refusing to draw anything serves nobody; the warning says the cap moved.
+    /// </para>
+    /// </remarks>
+    internal static int ResolveEffectiveReuse(
+        int requested, int tileCount, long cellCount, int columns, int rows, Size baseSize, ILogger logger)
+    {
+        var needed = MinimumReuseFor(requested, tileCount, cellCount);
+        if (needed == requested)
+        {
+            return requested;
+        }
+
+        var capacity = (long)tileCount * requested;
+
+        logger.LogWarning(
+            "A {Columns}x{Rows} grid needs {Cells:N0} cells, but {Tiles:N0} image(s) loaded can fill only " +
+            "{Capacity:N0} with --max-reuse {Requested}. Raising the cap to {Needed} so the mosaic is still " +
+            "produced — the smallest cap that covers the grid, though matching is greedy so some images " +
+            "may go unused while others hit the cap. Add more images or lower --tiles-across (about " +
+            "{Fits}) for one image per cell.",
+            columns, rows, cellCount, tileCount, capacity, requested, needed,
+            LargestGridWithin(baseSize, tileCount, requested));
+
+        return needed;
+    }
+
+    /// <summary>
+    /// The reuse cap needed to cover <paramref name="cellCount"/> cells, or
+    /// <paramref name="requested"/> when it is already enough. Pure arithmetic, no logging, so the
+    /// final mosaic and the stage previews compute the same number and only differ in what they say
+    /// about it.
+    /// </summary>
+    internal static int MinimumReuseFor(int requested, int tileCount, long cellCount)
+    {
+        // 0 is unlimited, so nothing to resolve. No tiles at all is not a reuse question — TileLibrary
+        // has already failed the run by this point.
+        if (requested <= 0 || tileCount <= 0 || (long)tileCount * requested >= cellCount)
+        {
+            return requested;
+        }
+
+        // Ceiling division: the smallest cap whose capacity covers every cell.
+        return (int)Math.Min(int.MaxValue, (cellCount + tileCount - 1) / tileCount);
+    }
+
+    /// <summary>
     /// Largest <c>--tiles-across</c> whose grid still fits in the images available, so the error can
     /// name a value that works instead of only saying "lower it".
     /// </summary>
@@ -791,6 +854,7 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
         private readonly StageSchedule schedule;
         private readonly Task<BaseAnalysis> baseTask;
         private readonly Size cellSize;
+        private readonly Size baseSize;
         private readonly float colorAdjustStrength;
         private readonly int repeatAvoidanceRadius;
         private readonly int maxTileReuse;
@@ -803,12 +867,14 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
             MosaicOptions options,
             Task<BaseAnalysis> baseTask,
             Size cellSize,
+            Size baseSize,
             ILogger logger,
             IProgressReporter progress)
         {
             schedule = new StageSchedule(TimeSpan.FromSeconds(options.StageIntervalSeconds));
             this.baseTask = baseTask;
             this.cellSize = cellSize;
+            this.baseSize = baseSize;
             colorAdjustStrength = (float)options.ColorAdjustStrength;
             repeatAvoidanceRadius = options.RepeatAvoidanceRadius;
             maxTileReuse = options.MaxTileReuse;
@@ -832,6 +898,7 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
             MosaicOptions options,
             Task<BaseAnalysis> baseTask,
             Size cellSize,
+            Size baseSize,
             ILogger logger,
             IProgressReporter progress)
         {
@@ -840,7 +907,7 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                 return null;
             }
 
-            return new StageWriter(options, baseTask, cellSize, logger, progress);
+            return new StageWriter(options, baseTask, cellSize, baseSize, logger, progress);
         }
 
         public async Task<bool> TryWriteAsync(
@@ -870,18 +937,31 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                     return false;
                 }
 
-                // The limits are limits for previews too. Early on there are genuinely too few tiles to
-                // fill the grid within the reuse cap or to honour the repeat distance; that is a reason
-                // to wait for the next stage, not to break the rule and not to fail the run.
-                if (maxTileReuse > 0 &&
-                    (long)tiles.Count * maxTileReuse < (long)analysis.Columns * analysis.Rows)
-                {
-                    return false;
-                }
+                // A preview from the first few hundred tiles has to reuse them, and showing that is the
+                // entire point of stages: the early picture is what makes a long run visible. The cap is
+                // raised to the least reuse that covers the grid, exactly as the final mosaic does when
+                // the folder is short — a stage is not a place to refuse.
+                //
+                // Computed with the log suppressed, unlike the final mosaic. Heavy reuse in stage 1 is
+                // expected and self-evident from the tile count in the phase name, so warning on every
+                // stage would bury the one warning that means something — the final mosaic's.
+                var stageCells = (long)analysis.Columns * analysis.Rows;
+                var stageReuse = MinimumReuseFor(maxTileReuse, tiles.Count, stageCells);
 
+                logger.LogDebug(
+                    "Stage {Index} from {Tiles:N0} tile(s) uses --max-reuse {Reuse} for {Cells:N0} cells.",
+                    index, tiles.Count, stageReuse, stageCells);
+
+                // The repeat distance is still absolute, for previews too. It needs very few images
+                // (13 for radius 2), so this only skips the first stage or two of a run whose interval is
+                // shorter than the time to load a dozen files.
                 if (tiles.Count < MinimumTilesForRepeatDistance(
                         analysis.Columns, analysis.Rows, repeatAvoidanceRadius))
                 {
+                    logger.LogDebug(
+                        "Skipping stage {Index}: {Tiles} tile(s) loaded, --repeat-distance {Radius} needs {Needed}.",
+                        index, tiles.Count, repeatAvoidanceRadius,
+                        MinimumTilesForRepeatDistance(analysis.Columns, analysis.Rows, repeatAvoidanceRadius));
                     return false;
                 }
 
@@ -895,7 +975,7 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                 {
                     var assignment = Assign(
                         analysis.CellSignatures, tiles, analysis.Columns, analysis.Rows,
-                        repeatAvoidanceRadius, maxTileReuse,
+                        repeatAvoidanceRadius, stageReuse,
                         phase: null, cancellationToken);
 
                     using var mosaic = Render(
