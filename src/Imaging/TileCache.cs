@@ -60,15 +60,17 @@ public sealed class TileCache : IDisposable
     /// </summary>
     /// <remarks>
     /// v2 dropped the entry count from the header and added <see cref="RecordMarker"/>, so entries can
-    /// be appended one at a time while tiles load.
+    /// be appended one at a time while tiles load. v3 stores a cell width <i>and</i> height rather than
+    /// one square size: cells now take the base image's aspect ratio, so cached square pixels from v2
+    /// are the wrong shape and must not be reused.
     /// </remarks>
-    private const int FormatVersion = 2;
+    private const int FormatVersion = 3;
 
     // Concurrent because tiles are loaded in parallel: TryGet reads while other threads Set. A plain
     // Dictionary read concurrently with a write is undefined behaviour, not merely a lost update.
     private readonly ConcurrentDictionary<string, Entry> entries;
     private readonly string path;
-    private readonly int tileSize;
+    private readonly Size cellSize;
     private readonly ILogger logger;
 
     // Serialises everything that touches the file. Appends happen from the parallel load loop, so the
@@ -85,10 +87,10 @@ public sealed class TileCache : IDisposable
     private int appended;
     private int superseded;
 
-    private TileCache(string path, int tileSize, ConcurrentDictionary<string, Entry> entries, ILogger logger)
+    private TileCache(string path, Size cellSize, ConcurrentDictionary<string, Entry> entries, ILogger logger)
     {
         this.path = path;
-        this.tileSize = tileSize;
+        this.cellSize = cellSize;
         this.entries = entries;
         this.logger = logger;
     }
@@ -105,7 +107,7 @@ public sealed class TileCache : IDisposable
     /// Resolves the cache file for a tiles folder at a given tile size. Separate folders and tile
     /// sizes get separate files, so a run never rewrites another configuration's cache.
     /// </summary>
-    public static string ResolveCachePath(string? cacheDirectory, string tilesFolder, int tileSize)
+    public static string ResolveCachePath(string? cacheDirectory, string tilesFolder, Size cellSize)
     {
         var directory = string.IsNullOrWhiteSpace(cacheDirectory)
             ? Path.Combine(
@@ -122,15 +124,16 @@ public sealed class TileCache : IDisposable
 
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized)))[..16];
 
-        return Path.Combine(directory, $"tiles-{hash}-t{tileSize}-v{FormatVersion}.bin");
+        return Path.Combine(
+            directory, $"tiles-{hash}-t{cellSize.Width}x{cellSize.Height}-v{FormatVersion}.bin");
     }
 
     /// <summary>Opens the cache for a run, returning an empty cache when it is missing or unusable.</summary>
-    public static TileCache Open(string? cacheDirectory, string tilesFolder, int tileSize, ILogger logger)
+    public static TileCache Open(string? cacheDirectory, string tilesFolder, Size cellSize, ILogger logger)
     {
-        var cachePath = ResolveCachePath(cacheDirectory, tilesFolder, tileSize);
+        var cachePath = ResolveCachePath(cacheDirectory, tilesFolder, cellSize);
         var entries = new ConcurrentDictionary<string, Entry>(StringComparer.OrdinalIgnoreCase);
-        var cache = new TileCache(cachePath, tileSize, entries, logger);
+        var cache = new TileCache(cachePath, cellSize, entries, logger);
 
         try
         {
@@ -154,7 +157,7 @@ public sealed class TileCache : IDisposable
     /// <summary>Deletes every cache file in the cache directory.</summary>
     public static int Clear(string? cacheDirectory, ILogger logger)
     {
-        var probe = ResolveCachePath(cacheDirectory, ".", 1);
+        var probe = ResolveCachePath(cacheDirectory, ".", new Size(1, 1));
         var directory = Path.GetDirectoryName(probe)!;
 
         if (!Directory.Exists(directory))
@@ -204,7 +207,7 @@ public sealed class TileCache : IDisposable
 
         try
         {
-            return Image.LoadPixelData<Rgba32>(entry.Pixels, tileSize, tileSize);
+            return Image.LoadPixelData<Rgba32>(entry.Pixels, cellSize.Width, cellSize.Height);
         }
         catch (Exception ex)
         {
@@ -219,7 +222,7 @@ public sealed class TileCache : IDisposable
     /// </summary>
     public void Set(FileInfo file, Image<Rgba32> resized)
     {
-        var pixels = new byte[tileSize * tileSize * 4];
+        var pixels = new byte[cellSize.Width * cellSize.Height * 4];
         resized.CopyPixelDataTo(pixels);
 
         var entry = new Entry(file.Length, file.LastWriteTimeUtc.Ticks, pixels);
@@ -402,15 +405,16 @@ public sealed class TileCache : IDisposable
             cachePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         using var reader = new BinaryReader(stream, Encoding.UTF8);
 
-        if (stream.Length < 12 ||
+        if (stream.Length < 16 ||
             reader.ReadUInt32() != Magic ||
             reader.ReadInt32() != FormatVersion ||
-            reader.ReadInt32() != tileSize)
+            reader.ReadInt32() != cellSize.Width ||
+            reader.ReadInt32() != cellSize.Height)
         {
             return 0;
         }
 
-        var expected = tileSize * tileSize * 4;
+        var expected = cellSize.Width * cellSize.Height * 4;
         var good = stream.Position;
 
         while (stream.Position < stream.Length)
@@ -467,7 +471,8 @@ public sealed class TileCache : IDisposable
     {
         writer.Write(Magic);
         writer.Write(FormatVersion);
-        writer.Write(tileSize);
+        writer.Write(cellSize.Width);
+        writer.Write(cellSize.Height);
         writer.Flush();
     }
 

@@ -10,9 +10,10 @@ additional images, it produces a new image that:
 - **reproduces the base image when viewed zoomed out** (or downscaled), and
 - **resolves into the individual source images when zoomed in**.
 
-The output keeps the base image's aspect ratio. "Looks like the base image" is not a vibe — it is
-measured as a mean CIE76 ΔE between corresponding cells of the mosaic and the base image, reported at
-the end of every run.
+The output keeps the base image's aspect ratio, and so does every individual tile — the cells are
+miniatures of the base image's shape, not squares. Each source image is used at most once by default.
+"Looks like the base image" is not a vibe — it is measured as a mean CIE76 ΔE between corresponding
+cells of the mosaic and the base image, reported at the end of every run.
 
 ## Layout
 
@@ -60,11 +61,11 @@ by default, so images in subfolders are included.
 | Short | Long | Config key | Default | Effect |
 | --- | --- | --- | --- | --- |
 | `-o` | `--output` | `OutputPath` | `<base>.mosaic.png` | Where the mosaic is written |
-| `-n` | `--tiles-across` | `TilesAcross` | 64 | Tiles along the **longer** axis; the short axis follows the aspect ratio |
-| `-s` | `--tile-size` | `TileSize` | 48 | Pixels per tile — how legible tiles are when zoomed in |
+| `-n` | `--tiles-across` | `TilesAcross` | 64 | Tiles **per axis**; the grid is `n × n` because the cells carry the aspect ratio, see below |
+| `-s` | `--tile-size` | `TileSize` | 48 | Pixels along a tile's **longer** edge; the shorter edge follows the base ratio |
 | `-g` | `--signature-grid` | `SignatureGrid` | 3 | Match patches per axis; 1 = average colour only, >1 also matches structure |
 | `-c` | `--color-adjust` | `ColorAdjustStrength` | **0 (off)** | 0 = untouched tiles, 1 = exactly the base image |
-| `-r` | `--max-reuse` | `MaxTileReuse` | 0 (unlimited) | Cap on placements per source image |
+| `-r` | `--max-reuse` | `MaxTileReuse` | **1 (no reuse)** | Cap on placements per source image; 0 = unlimited, see below |
 | `-d` | `--repeat-distance` | `RepeatAvoidanceRadius` | 2 | Cells that must separate two uses of one image — never relaxed, see below |
 | | `--recursive` | `Recursive` | true | Scan subfolders of the tiles folder; bare, or `--recursive false` |
 | `-f` | `--overwrite` | `Overwrite` | false | Replace an existing output file |
@@ -86,8 +87,12 @@ Mosaic__TilesAcross=80                # environment variable
 The two quality knobs pull against each other: raising `ColorAdjustStrength` or `TilesAcross`
 improves the zoomed-out likeness, while raising `TileSize` and lowering `ColorAdjustStrength`
 improves the zoomed-in detail. `ColorAdjustStrength` is 0 by default — the likeness comes from
-matching alone unless you ask for tinting. Output is roughly `TilesAcross × TileSize` pixels on the
-long edge — watch that product.
+matching alone unless you ask for tinting. Output is `TilesAcross × TileSize` pixels on the long edge —
+watch that product.
+
+`TilesAcross` also sets how many photos the folder must hold, because reuse is off by default: `n × n`
+cells need `n²` images, so the default 64 needs 4,096 and 120 needs 14,400. Too few and the run refuses
+up front, naming a grid that would fit.
 
 ## Commands
 
@@ -99,6 +104,61 @@ dotnet run --project src -- --help
 
 Use `--no-launch-profile` when running with arguments, otherwise `launchSettings.json` chimes in
 with extra output.
+
+## Tiles are shaped like the base image, and that forces a square grid
+
+A cell is a **miniature of the base image's shape**, not a square. `--tile-size` sets the longer edge
+and `ResolveTileSize` derives the shorter one from the base ratio: a 16:9 base at `-s 48` gives 48×27
+cells, a 3:4 base gives 36×48.
+
+**The grid is therefore square — `ResolveGrid` returns `(tilesAcross, tilesAcross)` — and that is
+arithmetic, not a preference.** The output measures `columns · cellWidth` by `rows · cellHeight`.
+Requiring both that the output match the base ratio *and* that `cellWidth : cellHeight` match it too
+leaves exactly one solution: `columns : rows == 1 : 1`. The aspect ratio lives in the cell shape or in
+the cell counts; it cannot live in both.
+
+It used to live in the counts: a proportional grid of square cells. That output *was* correctly
+proportioned, which is why it survived review — but `ResizeMode.Crop` then centre-cropped every source
+photo to a square, throwing away the sides of every landscape shot and the top and bottom of every
+portrait one. The mosaic was right in outline and wrong in every tile. Do not "simplify" back to
+square cells; if you change `ResolveGrid`, `Tiles_are_shaped_like_the_base_image_not_square` is what
+should stop you.
+
+- **Rounding to whole pixels is the only inexactness, and it is bounded by half a pixel.** 16:9 at
+  `-s 24` wants a 13.5px short edge and gets 14, so the cell is 1.714 rather than 1.778. The shape test
+  asserts the *rounded* short edge exactly rather than a ratio within some slack, so the residual is
+  pinned rather than hidden; at the default 48 it halves. A square base yields square cells, correctly.
+- **A square grid means the output ratio is exactly the cell ratio.** Anything that reports or asserts
+  output proportions can read them off one cell.
+- **The cache key is the cell's width *and* height** (`FormatVersion` 3) — see "The tile cache".
+
+## No image is reused unless reuse is asked for
+
+`-r` / `MaxTileReuse` **defaults to 1: each source image is placed at most once.** 0 means unlimited,
+N caps it at N.
+
+It defaulted to 0 — unlimited — so an ordinary run reused images heavily and admitted it only in a
+statistic nobody reads: 3,000 photos over a 120×90 grid produced **"715 distinct tile(s)" for 10,800
+cells**, i.e. every image about fifteen times over. Reporting "0 repeat-distance violations" alongside
+that number was true and beside the point; the run was reusing images wholesale and the summary did not
+say so in words. "Build a mosaic from this folder of photos" reads as one photo per cell, so that is
+the default.
+
+- **`--repeat-distance` does not cover this.** It is a *local* radius: it stops a repeat appearing near
+  its twin and permits one anywhere outside the radius. With the default `-r 1` it forbids nothing
+  extra; it earns its keep only once reuse is allowed with `-r 0` or `-r N`. Never present the radius as
+  a no-reuse guarantee.
+- **Too few images fails up front, and the message names a grid that fits.** `n × n` cells need `n²`
+  images without reuse, so the default 64 needs 4,096:
+  `A 20x15 grid needs 300 cells, but with each image is used at most once (--max-reuse 1, the default)
+  the 32 image(s) loaded can fill only 32. Add more images, lower --tiles-across (about 6 would fit),
+  raise --max-reuse, or pass --max-reuse 0 to allow unlimited reuse.` `LargestGridWithin` computes that
+  suggestion; it starts from `√capacity` and walks down rather than scanning from `tileCount`.
+- **Report reuse in words, not only as `DistinctTiles`.** A count that happens to be lower than the
+  cell count *is* the reuse, and a summary line is where a user would notice.
+- **Tests that are not about placement opt out explicitly with `MaxTileReuse = 0` / `-r 0`**, exactly
+  as they do for the radius. Fixtures with a dozen tiles cannot fill a 10×10 grid once each, and the cap
+  is never relaxed for anyone.
 
 ## Never change a source image's colours
 
@@ -219,8 +279,8 @@ stage, and on a short run that means no previews at all.
 
 Decoding a folder of full-size photos and resampling each to cell size is the dominant cost of a run
 and is fully deterministic, so the resized pixels are cached in
-`%LOCALAPPDATA%\GridArt\cache\tiles-<folder-hash>-t<TileSize>-v<FormatVersion>.bin`. Measured on 3,000
-photos at `TileSize=32`: loading takes **502ms** cold and **51ms** warm, for a 12.4 MB cache file.
+`%LOCALAPPDATA%\GridArt\cache\tiles-<folder-hash>-t<cellW>x<cellH>-v<FormatVersion>.bin`. Measured on
+3,000 photos at a 32px cell: loading takes **502ms** cold and **51ms** warm, for a 12.4 MB cache file.
 
 **Entries are appended as each tile decodes, not collected and written at the end.** With tens of
 thousands of images a cold run takes many minutes, and a single write at the end means a run
@@ -228,26 +288,32 @@ interrupted at minute nine — Ctrl-C, a crash, a full disk — leaves *nothing*
 time. Verified: a `kill -9` 0.35s into a 3,000-tile run left a 2.9 MB cache (of 12.4 MB full) that the
 next run reused for exactly 717 tiles, producing a mosaic byte-identical to one built from a full cache.
 
-### The file format (v2)
+### The file format (v3)
 
-Little-endian, written with `BinaryWriter`. A 12-byte header, then one record per tile, then nothing —
+Little-endian, written with `BinaryWriter`. A 16-byte header, then one record per tile, then nothing —
 **no count, no index, no footer**, which is what makes a new entry a single append:
 
 ```
 header  uint32  Magic         0x47524441  "GRDA"
-        int32   FormatVersion 2
-        int32   tileSize      pixels per side, so a mismatched file is rejected outright
+        int32   FormatVersion 3
+        int32   cellWidth     so a file written for another cell shape is rejected outright
+        int32   cellHeight
 
 record  uint32  RecordMarker  0x54494C45  "TILE"
         string  path          BinaryWriter 7-bit-encoded length prefix, UTF-8, absolute
         int64   length        source file size, for staleness
         int64   ticks         source LastWriteTimeUtc.Ticks, for staleness
-        byte[]  pixels        tileSize * tileSize * 4, raw RGBA, no compression
+        byte[]  pixels        cellWidth * cellHeight * 4, raw RGBA, no compression
 ```
 
-A record is `4 + (1..2 + bytes(path)) + 8 + 8 + tileSize²·4` bytes — 4,117 plus the path at
-`TileSize=32`. Duplicate paths are legal and **last one wins**; that is how a re-decoded stale entry
+A record is `4 + (1..2 + bytes(path)) + 8 + 8 + cellWidth·cellHeight·4` bytes — 4,117 plus the path at
+a 32×32 cell. Duplicate paths are legal and **last one wins**; that is how a re-decoded stale entry
 supersedes its predecessor without a rewrite, and `Save` compacts them away later.
+
+v3 replaced v2's single square `tileSize` with a width and a height, in both the header and the
+filename, because cells now take the base image's aspect ratio. A v2 file holds square pixels of the
+wrong shape for any non-square base, so it must not be reused — the version bump is what guarantees
+that, and it is why the dimensions belong in the key at all.
 
 **Yes, the run is interruptible, and the cache is why.** Reading stops at the first byte that is not a
 valid record, so a half-written tail from a `kill -9` is simply dropped and everything before it is
@@ -256,8 +322,10 @@ kept; the next append truncates to that offset before writing. Verified: a hard 
 produced a mosaic **byte-identical** to one built from a full cache. Cancellation itself is a
 `CancellationToken` threaded from `Worker.ExecuteAsync` through every phase and every parallel loop.
 
-**The cache key covers only what the cached pixels depend on:** the tiles folder, `TileSize`, the
-per-file identity (path + length + last-write time), and `FormatVersion`.
+**The cache key covers only what the cached pixels depend on:** the tiles folder, the cell width and
+height, the per-file identity (path + length + last-write time), and `FormatVersion`. `TileSize` alone
+is not enough — the cell shape also depends on the base image's aspect ratio, so a 48×27 cell and a
+48×48 one must not share a file even though both came from `-s 48`.
 
 Everything else is deliberately *excluded*, because it changes how tiles are selected or composited,
 not what a decoded tile looks like: `TilesAcross`, `SignatureGrid`, `ColorAdjustStrength`,
@@ -294,7 +362,8 @@ Rules when touching this code:
 - **Bump `FormatVersion` if the produced pixels could change** — resize sampler, crop mode, anchor,
   pixel format, or the file layout. It is part of the filename, so old entries are ignored rather
   than silently reused. Forgetting this is the one way to get a *wrong* mosaic from the cache rather
-  than a slow one. (v1 → v2 was the move to appendable records.)
+  than a slow one. (v1 → v2 was the move to appendable records; v2 → v3 the move from a square
+  `tileSize` to a cell width and height.)
 - **Signatures are never cached**, only pixels. Fingerprinting a cell-sized bitmap is trivially cheap,
   and recomputing it keeps `SignatureGrid` out of the key.
 - **The cache must never fail a run.** Every read/write error is swallowed and logged at debug, then
@@ -323,7 +392,7 @@ What runs in parallel, and why each is safe:
 
 | Phase | How | Why it is safe |
 | --- | --- | --- |
-| Base analysis ‖ tile loading | `Task.WhenAll` in `BuildAsync` | Cell signatures depend only on the base image; cached/resized tiles only on `TileSize`. Nothing is shared. |
+| Base analysis ‖ tile loading | `Task.WhenAll` in `BuildAsync` | Cell signatures depend only on the base image; cached/resized tiles only on the cell size. Nothing is shared. `Image.IdentifyAsync` reads the base *header* first so the cell shape is known without decoding, which is what keeps the overlap. |
 | `Analysing base image` | `Parallel.For` over cell rows | Read-only on the base image; each row writes only its own signature slots. |
 | `Loading tiles` | `Parallel.ForEachAsync` | Decoding is CPU-bound and per-file; the shared list is under a `Lock`, the cache is a `ConcurrentDictionary` with a file lock for appends. |
 | `Matching tiles` (distances) | `Parallel.For` over a block of cells | A cell's distance to every tile is independent of what other cells chose. |
@@ -393,14 +462,25 @@ folder`, `Loading tiles` (with `Stage N from … tile(s)` interleaved), `Finalis
   genuinely cannot be met the run **fails with a message saying what to change** — it does not produce
   an image that breaks the rule and mention it in a warning. Any new option gets the same treatment:
   obey it, or refuse the run. Defaults follow from the same principle: nothing that alters the source
-  images happens unless it was asked for, which is why `ColorAdjustStrength` is 0.
+  images happens unless it was asked for, which is why `ColorAdjustStrength` is 0 and `MaxTileReuse`
+  is 1.
+- **A default is a promise about the obvious reading of the request.** Both defaults that shipped wrong
+  — a 0.35 tint and unlimited reuse — were defensible as *pictures* and indefensible as *answers to
+  what was asked*: build a mosaic out of these photos, not out of recoloured copies of a seventh of
+  them. When a default trades fidelity for a nicer-looking result, it is the wrong default.
+- **Say what happened in words, not only in a statistic.** "715 distinct tile(s)" was a truthful
+  report of heavy reuse that nobody could be expected to read as one. Reporting a narrow check as
+  though it settled a broader question is the same failure. If a run did something the user did not
+  ask for, the summary has to name it.
 - **Match perceptually.** Distances are CIELAB ΔE, not RGB Euclidean. Squared ΔE is kept through the
   inner matching loop to avoid square roots; take the root only when reporting.
 - **Derive grid boundaries with scaled integer division** (`i * total / n`), so cells tile the source
   exactly and no row or column of pixels is dropped or double-counted. Don't use a rounded cell
   width multiplied by an index.
-- **Keep the aspect ratio.** `MosaicBuilder.ResolveGrid` lays tiles along the long axis and derives
-  the short one. A mosaic that doesn't match the base image's proportions is a bug.
+- **Keep the aspect ratio, in the tiles as well as the output.** `ResolveTileSize` shapes each cell
+  like the base image and `ResolveGrid` is square as a consequence — see "Tiles are shaped like the base
+  image". A mosaic that doesn't match the base image's proportions is a bug; so is one that matches them
+  by centre-cropping every photo to a square.
 - **Skip bad tile files, don't fail the run.** Tile folders are real photo libraries with stray
   files; log a warning and continue. Failing only makes sense when *no* image could be decoded.
 - **Dispose images.** `Tile`, `TileLibrary` and `MosaicResult` are all `IDisposable`; ImageSharp
@@ -457,6 +537,14 @@ product claim*, not just that code runs:
   on a flat base and on a gradient, and at the exact computed minimum tile count,
 - too few images for the requested radius **fails** with a message naming how many are needed, rather
   than relaxing anything,
+- a default run places **every source image at most once** — asserted by fingerprinting all 100 cells of
+  a 10×10 grid built from exactly 100 distinct images and requiring 100 distinct fingerprints, not by
+  trusting the `DistinctTiles` statistic,
+- too few images for `--max-reuse` fails with a message naming the shortfall *and* a `--tiles-across`
+  that would fit,
+- cells are shaped like the base image across landscape, portrait, 16:9 and square bases: the long edge
+  is exactly `--tile-size`, the short edge is the ideal length rounded to a whole pixel, orientation
+  follows the base, and the output ratio equals the cell ratio,
 - a bare boolean flag does not swallow the option after it (`--recursive -n 120`),
 - linear-light averaging is verified against a known value (half black + half white → sRGB ~188).
 
@@ -500,6 +588,9 @@ test project.
 - Matching is a single greedy pass in raster order, not a global optimal assignment. It is fast and
   deterministic, but a cell late in the scan can be left with weaker choices under a low
   `MaxTileReuse`.
-- Tiles are centre-cropped to a square cell, so off-centre subjects can be clipped.
+- Tiles are centre-cropped to the cell, so off-centre subjects can still be clipped — much less than
+  under the old square cells, but a portrait photo in a 16:9 mosaic loses its top and bottom.
+- A cell's short edge is rounded to a whole pixel, so the output ratio can differ from the base ratio by
+  up to half a pixel's worth (3.6% at 16:9 with `-s 24`, 1.8% at `-s 48`).
 - The whole mosaic is held in memory; `TilesAcross × TileSize` beyond ~20000px on an edge will be
   memory-hungry.

@@ -26,15 +26,31 @@ public sealed class MosaicOptions
     /// </summary>
     public string? OutputPath { get; set; }
 
-    /// <summary>Number of tiles along the longer axis of the output. Drives how far you must zoom out.</summary>
+    /// <summary>
+    /// Number of tiles along each axis, so the grid is <c>TilesAcross × TilesAcross</c> cells. Drives
+    /// how far you must zoom out.
+    /// </summary>
+    /// <remarks>
+    /// The grid is square because the <i>cells</i> carry the base image's aspect ratio — see
+    /// <see cref="TileSize"/> and <c>MosaicBuilder.ResolveGrid</c>. The output is still shaped like the
+    /// base image; the proportion simply lives in the tile shape rather than in the cell counts.
+    /// </remarks>
     [Range(1, 4096)]
     public int TilesAcross { get; set; } = 64;
 
     /// <summary>
-    /// Resolution each tile is rendered at. Larger values keep the individual pictures legible when
-    /// you zoom in, at the cost of output size: the mosaic is roughly
+    /// Length of a tile's <b>longer</b> edge in pixels. The shorter edge follows the base image's
+    /// aspect ratio, so a tile is shaped like the base image rather than square. Larger values keep the
+    /// individual pictures legible when you zoom in, at the cost of output size: the mosaic is roughly
     /// TilesAcross × TileSize pixels on its long edge.
     /// </summary>
+    /// <remarks>
+    /// Tiles used to be square regardless of the base image. Square cells do tile a proportional grid
+    /// exactly, so the *output* kept the right proportions — but every source photo was then
+    /// centre-cropped to a square, which throws away the sides of every landscape shot and the top and
+    /// bottom of every portrait one. A tile shaped like the base image crops far less and looks like the
+    /// picture it came from. See <c>MosaicBuilder.ResolveTileSize</c>.
+    /// </remarks>
     [Range(4, 1024)]
     public int TileSize { get; set; } = 48;
 
@@ -59,11 +75,25 @@ public sealed class MosaicOptions
     public double ColorAdjustStrength { get; set; }
 
     /// <summary>
-    /// How many times one tile image may be placed. 0 means unlimited. Low values force variety but
-    /// require enough source images to cover every cell.
+    /// How many times one source image may be placed. <b>Defaults to 1: each image is used at most
+    /// once.</b> 0 means unlimited.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This defaulted to 0 (unlimited), which meant an ordinary run reused images heavily and said so
+    /// only in a statistic nobody reads: 3,000 photos covering a 120×90 grid produced "715 distinct
+    /// tile(s)" for 10,800 cells — every image about 15 times over. <c>--repeat-distance</c> does not
+    /// prevent that; it is a local radius, so it only stops a repeat appearing *near* its twin.
+    /// </para>
+    /// <para>
+    /// "Do not reuse an image" is the obvious reading of a photomosaic built from a folder of photos, so
+    /// it is the default. It requires at least as many images as the grid has cells, and the run says so
+    /// up front when the folder is too small rather than silently reusing. Pass <c>-r 0</c> to allow
+    /// unlimited reuse, or <c>-r N</c> to cap it at N.
+    /// </para>
+    /// </remarks>
     [Range(0, int.MaxValue)]
-    public int MaxTileReuse { get; set; }
+    public int MaxTileReuse { get; set; } = 1;
 
     /// <summary>
     /// Radius, in cells, within which the same tile image is not repeated. Breaks up the visible

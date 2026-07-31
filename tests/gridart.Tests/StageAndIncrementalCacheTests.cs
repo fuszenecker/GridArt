@@ -30,7 +30,7 @@ public sealed class StageAndIncrementalCacheTests : IDisposable
         var tiles = CreateTileFolder("tiles", 5);
         var cacheDir = Path.Combine(root, "append");
 
-        var writer = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance);
+        var writer = TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance);
         foreach (var file in Directory.GetFiles(tiles).Order())
         {
             using var image = new Image<Rgba32>(8, 8, new Rgba32(10, 20, 30));
@@ -38,7 +38,7 @@ public sealed class StageAndIncrementalCacheTests : IDisposable
         }
 
         // Deliberately no Save() — a killed process never gets to call it.
-        var reader = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance);
+        var reader = TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance);
         Assert.Equal(5, reader.LoadedCount);
         Assert.Equal(5, writer.AppendedCount);
     }
@@ -50,9 +50,9 @@ public sealed class StageAndIncrementalCacheTests : IDisposable
         // work and must not be thrown away.
         var tiles = CreateTileFolder("tiles", 6);
         var cacheDir = Path.Combine(root, "torn");
-        var cachePath = TileCache.ResolveCachePath(cacheDir, tiles, 8);
+        var cachePath = TileCache.ResolveCachePath(cacheDir, tiles, new Size(8, 8));
 
-        var writer = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance);
+        var writer = TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance);
         foreach (var file in Directory.GetFiles(tiles).Order())
         {
             using var image = new Image<Rgba32>(8, 8, new Rgba32(90, 90, 90));
@@ -66,7 +66,7 @@ public sealed class StageAndIncrementalCacheTests : IDisposable
         var truncated = intact.Take(12 + perRecord * 4 + perRecord / 2).ToArray();
         File.WriteAllBytes(cachePath, truncated);
 
-        var reader = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance);
+        var reader = TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance);
         Assert.Equal(4, reader.LoadedCount);
     }
 
@@ -75,10 +75,10 @@ public sealed class StageAndIncrementalCacheTests : IDisposable
     {
         var tiles = CreateTileFolder("tiles", 4);
         var cacheDir = Path.Combine(root, "reappend");
-        var cachePath = TileCache.ResolveCachePath(cacheDir, tiles, 8);
+        var cachePath = TileCache.ResolveCachePath(cacheDir, tiles, new Size(8, 8));
         var files = Directory.GetFiles(tiles).Order().ToArray();
 
-        var first = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance);
+        var first = TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance);
         using (var image = new Image<Rgba32>(8, 8, new Rgba32(1, 2, 3)))
         {
             first.Set(new FileInfo(files[0]), image);
@@ -91,7 +91,7 @@ public sealed class StageAndIncrementalCacheTests : IDisposable
             stream.Write([0x11, 0x22, 0x33]);
         }
 
-        var second = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance);
+        var second = TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance);
         Assert.Equal(1, second.LoadedCount);
 
         using (var image = new Image<Rgba32>(8, 8, new Rgba32(4, 5, 6)))
@@ -101,7 +101,7 @@ public sealed class StageAndIncrementalCacheTests : IDisposable
         second.Dispose();
 
         // Both entries must be readable, so the junk was truncated rather than appended past.
-        var third = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance);
+        var third = TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance);
         Assert.Equal(2, third.LoadedCount);
     }
 
@@ -115,10 +115,10 @@ public sealed class StageAndIncrementalCacheTests : IDisposable
 
         using (await BuildAsync(basePath, tiles, cacheDir)) { }
 
-        var cachePath = TileCache.ResolveCachePath(cacheDir, tiles, 8);
+        var cachePath = TileCache.ResolveCachePath(cacheDir, tiles, new Size(8, 8));
         var writtenAt = File.GetLastWriteTimeUtc(cachePath);
 
-        var cache = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance);
+        var cache = TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance);
         Assert.False(
             cache.Save(Directory.GetFiles(tiles)),
             "Nothing changed, so the cache must not be rewritten.");
@@ -134,7 +134,7 @@ public sealed class StageAndIncrementalCacheTests : IDisposable
         var tiles = CreateTileFolder("relative", 5);
         var cacheDir = Path.Combine(root, "relative-cache");
 
-        var writer = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance);
+        var writer = TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance);
         foreach (var file in Directory.GetFiles(tiles).Order())
         {
             using var image = new Image<Rgba32>(8, 8, new Rgba32(50, 60, 70));
@@ -151,7 +151,7 @@ public sealed class StageAndIncrementalCacheTests : IDisposable
 
         Assert.False(writer.Save(relative), "Nothing is stale, so nothing may be pruned or rewritten.");
         writer.Dispose();
-        Assert.Equal(5, TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance).LoadedCount);
+        Assert.Equal(5, TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance).LoadedCount);
     }
 
     [Fact]
@@ -161,7 +161,7 @@ public sealed class StageAndIncrementalCacheTests : IDisposable
         var cacheDir = Path.Combine(root, "prune");
         var files = Directory.GetFiles(tiles).Order().ToArray();
 
-        var writer = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance);
+        var writer = TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance);
         foreach (var file in files)
         {
             using var image = new Image<Rgba32>(8, 8, new Rgba32(70, 70, 70));
@@ -171,7 +171,7 @@ public sealed class StageAndIncrementalCacheTests : IDisposable
         Assert.True(writer.Save(files.Take(3).ToArray()), "Pruning three entries requires a rewrite.");
         writer.Dispose();
 
-        Assert.Equal(3, TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance).LoadedCount);
+        Assert.Equal(3, TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance).LoadedCount);
     }
 
     [Fact]
@@ -199,7 +199,7 @@ public sealed class StageAndIncrementalCacheTests : IDisposable
         var cacheDir = Path.Combine(root, "partial");
         var files = Directory.GetFiles(tiles).Order().ToArray();
 
-        var interrupted = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance);
+        var interrupted = TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance);
         foreach (var file in files.Take(5))
         {
             using var image = await Image.LoadAsync<Rgba32>(file);
@@ -208,7 +208,7 @@ public sealed class StageAndIncrementalCacheTests : IDisposable
         }
         interrupted.Dispose(); // No Save: the process "died" here.
 
-        var resumed = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance);
+        var resumed = TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance);
         Assert.Equal(5, resumed.LoadedCount);
 
         // And a full run on top of it produces the same mosaic as one from an empty cache.
@@ -335,11 +335,11 @@ public sealed class StageAndIncrementalCacheTests : IDisposable
         var tiles = CreateTileFolder("tiles", 12);
         var output = Path.Combine(root, "cli.png");
 
-        // -d 0: this asserts the --stage-interval mapping, and 12 tiles cannot satisfy the default
-        // repeat distance on a 10x10 grid.
+        // -d 0 -r 0: this asserts the --stage-interval mapping, and 12 tiles can neither satisfy the
+        // default repeat distance on a 10x10 grid nor cover its 100 cells without reuse.
         var exitCode = await RunCliAsync(
             [basePath, tiles, "-n", "10", "-s", "8", "-o", output, "-f", "--stage-interval", "0",
-             "-d", "0"]);
+             "-d", "0", "-r", "0"]);
 
         Assert.Equal(0, exitCode);
         Assert.True(File.Exists(output));
@@ -437,6 +437,11 @@ public sealed class StageAndIncrementalCacheTests : IDisposable
             // deliberately: the constraint is not relaxed for anyone, so a test that does not care
             // about it has to say so rather than quietly get a weaker version of it.
             RepeatAvoidanceRadius = 0,
+
+            // Same reasoning for reuse: the default is "each image once", which a 10x10 grid cannot do
+            // with 8 tiles. Reuse is what these fixtures need in order to exist at all, so they ask for
+            // it explicitly instead of the builder quietly allowing it.
+            MaxTileReuse = 0,
         };
 
         return await new MosaicBuilder(NullLogger<MosaicBuilder>.Instance)

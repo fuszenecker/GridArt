@@ -39,23 +39,75 @@ public sealed class MosaicBuilderTests : IDisposable
             TilesFolder = tiles,
             TilesAcross = 20,
             TileSize = 16,
+            MaxTileReuse = 0, // fixture-scale grid: reuse is what lets a small tile folder fill it
         };
 
         using var result = await BuildAsync(options);
 
-        // 400x300 is 4:3, so 20 columns must pair with 15 rows.
+        // The grid is square and the cells carry the 4:3 ratio: 16x12 cells, 20 of them per axis.
         Assert.Equal(20, result.Columns);
-        Assert.Equal(15, result.Rows);
+        Assert.Equal(20, result.Rows);
         Assert.Equal(320, result.Image.Width);
         Assert.Equal(240, result.Image.Height);
 
+        // The product is what the user actually sees, and it must still match the base proportions.
         var baseRatio = 400d / 300d;
         var mosaicRatio = result.Image.Width / (double)result.Image.Height;
         Assert.Equal(baseRatio, mosaicRatio, 0.01);
     }
 
+    [Theory]
+    [InlineData(400, 300)]   // 4:3 landscape
+    [InlineData(300, 400)]   // 3:4 portrait
+    [InlineData(1920, 1080)] // 16:9
+    [InlineData(500, 500)]   // square base — cells stay square, which is correct here
+    public async Task Tiles_are_shaped_like_the_base_image_not_square(int width, int height)
+    {
+        // The complaint this fixes: tiles were square whatever the base image looked like, so every
+        // landscape photo lost its sides and every portrait one its top and bottom to the centre crop.
+        // A cell must be a miniature of the base image's shape.
+        var basePath = CreateQuadrantBaseImage($"shape-{width}x{height}.png", width, height);
+        var tiles = CreateTileFolder($"shape-tiles-{width}x{height}", 40);
+
+        using var result = await BuildAsync(new MosaicOptions
+        {
+            BaseImage = basePath,
+            TilesFolder = tiles,
+            TilesAcross = 8,
+            TileSize = 24,
+            MaxTileReuse = 0,
+            RepeatAvoidanceRadius = 0,
+        });
+
+        var cellWidth = result.Image.Width / result.Columns;
+        var cellHeight = result.Image.Height / result.Rows;
+        var baseRatio = (double)width / height;
+
+        // The long edge is exactly --tile-size, so the option keeps meaning what it says.
+        Assert.Equal(24, Math.Max(cellWidth, cellHeight));
+
+        // The short edge is the ideal length rounded to a whole pixel, which is as close as a raster
+        // cell can get. Asserted exactly rather than through a ratio tolerance because the residual
+        // error is real and worth pinning: 16:9 at --tile-size 24 wants a 13.5px short edge and gets
+        // 14, i.e. 1.714 instead of 1.778. That is a whole-pixel artefact of a small tile, not a
+        // logic error — at the default 48 it halves, and it can never exceed half a pixel.
+        var expectedShort = Math.Max(1, (int)Math.Round(24 / Math.Max(baseRatio, 1 / baseRatio)));
+        Assert.Equal(expectedShort, Math.Min(cellWidth, cellHeight));
+
+        // Orientation follows the base image: a landscape base never yields portrait cells.
+        Assert.Equal(width >= height, cellWidth >= cellHeight);
+
+        // And the whole mosaic keeps the base image's proportions — exactly the cell's, because a
+        // square grid multiplies both edges by the same count. The tolerance is what half a pixel on
+        // the short edge is worth as a ratio, so it tightens as --tile-size grows instead of hiding a
+        // real deviation behind a fixed slack.
+        var outputRatio = result.Image.Width / (double)result.Image.Height;
+        Assert.Equal(cellWidth / (double)cellHeight, outputRatio, 1e-9);
+        Assert.Equal(baseRatio, outputRatio, baseRatio >= 1 ? 0.5 * baseRatio * baseRatio / 24 : 0.5 / 24);
+    }
+
     [Fact]
-    public async Task Portrait_base_image_lays_tiles_across_the_long_axis()
+    public async Task Portrait_base_image_produces_portrait_tiles()
     {
         var basePath = CreateQuadrantBaseImage("portrait.png", 300, 600);
         var tiles = CreateTileFolder("tiles", 24);
@@ -66,10 +118,15 @@ public sealed class MosaicBuilderTests : IDisposable
             TilesFolder = tiles,
             TilesAcross = 24,
             TileSize = 8,
+            MaxTileReuse = 0, // fixture-scale grid: reuse is what lets a small tile folder fill it
         });
 
+        // A 1:2 base gives 1:2 cells on a square grid, so the output is 1:2 overall. The cell counts no
+        // longer differ per axis — the shape moved into the cells, where it stops cropping the photos.
         Assert.Equal(24, result.Rows);
-        Assert.Equal(12, result.Columns);
+        Assert.Equal(24, result.Columns);
+        Assert.Equal(4, result.Image.Width / result.Columns);
+        Assert.Equal(8, result.Image.Height / result.Rows);
     }
 
     [Fact]
@@ -84,6 +141,7 @@ public sealed class MosaicBuilderTests : IDisposable
             TilesFolder = tiles,
             TilesAcross = 24,
             TileSize = 16,
+            MaxTileReuse = 0, // fixture-scale grid: reuse is what lets a small tile folder fill it
             ColorAdjustStrength = 0d, // pure tile matching — no tinting to prop up the likeness
             RepeatAvoidanceRadius = 0,
         });
@@ -128,6 +186,7 @@ public sealed class MosaicBuilderTests : IDisposable
             TilesFolder = tiles,
             TilesAcross = 10,
             TileSize = 16,
+            MaxTileReuse = 0, // fixture-scale grid: reuse is what lets a small tile folder fill it
 
             // ColorAdjustStrength and RepeatAvoidanceRadius are deliberately left at their defaults:
             // this test is about what an ordinary invocation does, so setting them would defeat it.
@@ -178,6 +237,7 @@ public sealed class MosaicBuilderTests : IDisposable
             TilesFolder = tiles,
             TilesAcross = 16,
             TileSize = 12,
+            MaxTileReuse = 0, // fixture-scale grid: reuse is what lets a small tile folder fill it
             ColorAdjustStrength = 1d,
         });
 
@@ -205,6 +265,7 @@ public sealed class MosaicBuilderTests : IDisposable
             TilesFolder = tiles,
             TilesAcross = 16,
             TileSize = 24,
+            MaxTileReuse = 0, // fixture-scale grid: reuse is what lets a small tile folder fill it
             ColorAdjustStrength = 0.35d,
         });
 
@@ -248,6 +309,7 @@ public sealed class MosaicBuilderTests : IDisposable
             TilesFolder = tiles,
             TilesAcross = 10,
             TileSize = 8,
+            MaxTileReuse = 0, // fixture-scale grid: reuse is what lets a small tile folder fill it
             RepeatAvoidanceRadius = radius,
             ColorAdjustStrength = 0d,
         });
@@ -269,6 +331,7 @@ public sealed class MosaicBuilderTests : IDisposable
             TilesFolder = tiles,
             TilesAcross = 12,
             TileSize = 8,
+            MaxTileReuse = 0, // fixture-scale grid: reuse is what lets a small tile folder fill it
             RepeatAvoidanceRadius = 2,
             ColorAdjustStrength = 0d,
         });
@@ -290,6 +353,7 @@ public sealed class MosaicBuilderTests : IDisposable
             TilesFolder = tiles,
             TilesAcross = 10,
             TileSize = 8,
+            MaxTileReuse = 0, // fixture-scale grid: reuse is what lets a small tile folder fill it
             RepeatAvoidanceRadius = 0,
             ColorAdjustStrength = 0d,
         });
@@ -313,6 +377,7 @@ public sealed class MosaicBuilderTests : IDisposable
             TilesFolder = tiles,
             TilesAcross = 10,
             TileSize = 8,
+            MaxTileReuse = 0, // fixture-scale grid: reuse is what lets a small tile folder fill it
             RepeatAvoidanceRadius = 3,
             ColorAdjustStrength = 0d,
         }));
@@ -339,6 +404,7 @@ public sealed class MosaicBuilderTests : IDisposable
             TilesFolder = tiles,
             TilesAcross = 10,
             TileSize = 8,
+            MaxTileReuse = 0, // fixture-scale grid: reuse is what lets a small tile folder fill it
             RepeatAvoidanceRadius = 2,
             ColorAdjustStrength = 0d,
         });
@@ -422,10 +488,70 @@ public sealed class MosaicBuilderTests : IDisposable
             TilesAcross = 10, // 100 cells against 4 tiles x 1 use
             TileSize = 8,
             MaxTileReuse = 1,
+            RepeatAvoidanceRadius = 0, // the reuse cap is what must fail here, not the radius
         };
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => BuildAsync(options));
-        Assert.Contains("MaxTileReuse", ex.Message);
+
+        // The message has to be actionable, which means naming the shortfall and a --tiles-across that
+        // would actually fit. "MaxTileReuse exceeded" tells the user nothing they can do.
+        Assert.Contains("100", ex.Message);
+        Assert.Contains("4 image(s)", ex.Message);
+        Assert.Contains("--tiles-across", ex.Message);
+        Assert.Contains("--max-reuse 0", ex.Message);
+    }
+
+    [Fact]
+    public void Images_are_not_reused_unless_reuse_is_asked_for()
+    {
+        // The default that matters: a photomosaic built from a folder of photos should use each photo
+        // once. This defaulted to 0 (unlimited), so an ordinary run reused every image about 15 times
+        // and only admitted it in a "715 distinct tile(s)" statistic. --repeat-distance does not cover
+        // this — it is a local radius, so it permits a duplicate anywhere outside that radius.
+        Assert.Equal(1, new MosaicOptions().MaxTileReuse);
+    }
+
+    [Fact]
+    public async Task Default_run_uses_every_source_image_at_most_once()
+    {
+        // The end-to-end guarantee, asserted from the rendered pixels rather than from the assignment:
+        // as many distinct cell images as there are cells means nothing was placed twice.
+        var basePath = CreateGradientImage("no-reuse-base.png", 200, 200);
+
+        // 10x10 = 100 cells, and exactly 100 visually distinct images — so "each used once" is only
+        // satisfiable by using all of them, and any duplicate shows up immediately.
+        var tiles = CreateDistinctTileFolder("no-reuse-tiles", 100);
+
+        using var result = await BuildAsync(new MosaicOptions
+        {
+            BaseImage = basePath,
+            TilesFolder = tiles,
+            TilesAcross = 10,
+            TileSize = 8,
+
+            // MaxTileReuse is deliberately not set: this asserts what a default run does.
+            RepeatAvoidanceRadius = 0,
+        });
+
+        var cells = result.Columns * result.Rows;
+        Assert.Equal(100, cells);
+        Assert.Equal(cells, result.Quality.DistinctTiles);
+
+        // Confirmed against the pixels too, in case DistinctTiles were ever computed wrongly.
+        var tileSize = result.Image.Width / result.Columns;
+        var cellHeight = result.Image.Height / result.Rows;
+        var fingerprints = new HashSet<string>();
+
+        for (var row = 0; row < result.Rows; row++)
+        {
+            for (var col = 0; col < result.Columns; col++)
+            {
+                fingerprints.Add(CellFingerprint(
+                    result.Image, new Rectangle(col * tileSize, row * cellHeight, tileSize, cellHeight)));
+            }
+        }
+
+        Assert.Equal(cells, fingerprints.Count);
     }
 
     [Fact]
@@ -441,6 +567,7 @@ public sealed class MosaicBuilderTests : IDisposable
             TilesFolder = empty,
             TilesAcross = 4,
             TileSize = 8,
+            MaxTileReuse = 0, // fixture-scale grid: reuse is what lets a small tile folder fill it
         }));
 
         Assert.Contains("No supported images", ex.Message);
@@ -460,6 +587,7 @@ public sealed class MosaicBuilderTests : IDisposable
             TilesFolder = tiles,
             TilesAcross = 6,
             TileSize = 8,
+            MaxTileReuse = 0, // fixture-scale grid: reuse is what lets a small tile folder fill it
 
             // This test is about skipping unreadable files, not placement; 8 tiles cannot satisfy the
             // default repeat distance on a 6x6 grid, and that constraint is never relaxed.
@@ -477,15 +605,23 @@ public sealed class MosaicBuilderTests : IDisposable
     }
 
     [Fact]
-    public void ResolveGrid_keeps_the_aspect_ratio_and_never_returns_zero()
+    public void The_grid_is_square_and_the_cell_carries_the_aspect_ratio()
     {
-        Assert.Equal((32, 18), MosaicBuilder.ResolveGrid(new Size(1920, 1080), 32));
-        Assert.Equal((18, 32), MosaicBuilder.ResolveGrid(new Size(1080, 1920), 32));
-        Assert.Equal((10, 10), MosaicBuilder.ResolveGrid(new Size(500, 500), 10));
+        // Together these two are the whole geometry: a square grid of base-shaped cells. Asserted as a
+        // pair because neither is right on its own — a square grid of square cells would distort the
+        // output, and base-shaped cells on a proportional grid would distort it the other way.
+        Assert.Equal((32, 32), MosaicBuilder.ResolveGrid(new Size(1920, 1080), 32));
+        Assert.Equal((32, 32), MosaicBuilder.ResolveGrid(new Size(1080, 1920), 32));
 
-        // An extreme panorama must still produce at least one row.
-        var (_, rows) = MosaicBuilder.ResolveGrid(new Size(4000, 20), 10);
-        Assert.True(rows >= 1);
+        Assert.Equal(new Size(48, 27), MosaicBuilder.ResolveTileSize(new Size(1920, 1080), 48));
+        Assert.Equal(new Size(27, 48), MosaicBuilder.ResolveTileSize(new Size(1080, 1920), 48));
+        Assert.Equal(new Size(48, 48), MosaicBuilder.ResolveTileSize(new Size(500, 500), 48));
+
+        // 32 cells x 48px wide by 32 x 27px high is 1536x864 — still exactly 16:9.
+        Assert.Equal(1920d / 1080d, 32 * 48 / (double)(32 * 27), 0.01);
+
+        // An extreme panorama must still produce a cell at least one pixel tall.
+        Assert.True(MosaicBuilder.ResolveTileSize(new Size(4000, 20), 10).Height >= 1);
     }
 
     [Fact]
@@ -635,9 +771,10 @@ public sealed class MosaicBuilderTests : IDisposable
         Assert.Null(CommandLine.FindUnknownSwitch([rootedBase, rootedTiles]));
 
         var output = Path.Combine(root, "rooted.png");
-        // -d 0: this is about path handling, and 10 tiles cannot satisfy the default repeat distance.
+        // -d 0 -r 0: this is about path handling, and 10 tiles can neither satisfy the default repeat
+        // distance nor cover 64 cells without reuse.
         var exitCode = await RunCliAsync(
-            [rootedBase, rootedTiles, "-n", "8", "-s", "8", "-o", output, "-f", "-d", "0"]);
+            [rootedBase, rootedTiles, "-n", "8", "-s", "8", "-o", output, "-f", "-d", "0", "-r", "0"]);
 
         Assert.Equal(0, exitCode);
         Assert.True(File.Exists(output), "A slash-prefixed path should have produced a mosaic.");
@@ -667,6 +804,7 @@ public sealed class MosaicBuilderTests : IDisposable
             TilesFolder = nested,
             TilesAcross = 8,
             TileSize = 8,
+            MaxTileReuse = 0, // fixture-scale grid: reuse is what lets a small tile folder fill it
             RepeatAvoidanceRadius = 0,
         });
         Assert.True(recursive.Quality.DistinctTiles > 2, "Recursive scan should reach nested folders.");
@@ -678,6 +816,7 @@ public sealed class MosaicBuilderTests : IDisposable
             TilesFolder = nested,
             TilesAcross = 8,
             TileSize = 8,
+            MaxTileReuse = 0, // fixture-scale grid: reuse is what lets a small tile folder fill it
             Recursive = false,
         }));
         Assert.Contains("No supported images", ex.Message);
@@ -721,13 +860,13 @@ public sealed class MosaicBuilderTests : IDisposable
         var tiles = CreateTileFolder("tiles", 12);
         var cacheDir = Path.Combine(root, "cache-hits");
 
-        var cachePath = TileCache.ResolveCachePath(cacheDir, tiles, 8);
+        var cachePath = TileCache.ResolveCachePath(cacheDir, tiles, new Size(8, 8));
         Assert.False(File.Exists(cachePath), "The cache should not exist before the first run.");
 
         await BuildToBytesAsync(basePath, tiles, cacheDir);
         Assert.True(File.Exists(cachePath), "The first run should have written the cache.");
 
-        var cache = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance);
+        var cache = TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance);
         Assert.Equal(12, cache.LoadedCount);
 
         // Every entry should be a usable hit on the unchanged files.
@@ -748,11 +887,11 @@ public sealed class MosaicBuilderTests : IDisposable
 
         // Distinct files, so a 16px run can never be served 8px pixels.
         Assert.NotEqual(
-            TileCache.ResolveCachePath(cacheDir, tiles, 8),
-            TileCache.ResolveCachePath(cacheDir, tiles, 16));
+            TileCache.ResolveCachePath(cacheDir, tiles, new Size(8, 8)),
+            TileCache.ResolveCachePath(cacheDir, tiles, new Size(16, 16)));
 
-        var cache8 = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance);
-        var cache16 = TileCache.Open(cacheDir, tiles, 16, NullLogger.Instance);
+        var cache8 = TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance);
+        var cache16 = TileCache.Open(cacheDir, tiles, new Size(16, 16), NullLogger.Instance);
         Assert.Equal(8, cache8.LoadedCount);
         Assert.Equal(8, cache16.LoadedCount);
     }
@@ -790,18 +929,19 @@ public sealed class MosaicBuilderTests : IDisposable
             BaseImage = basePath,
             TilesFolder = tiles,
             TileSize = 8,
+            MaxTileReuse = 0, // fixture-scale grid: reuse is what lets a small tile folder fill it
             TilesAcross = 10,
             CacheDirectory = cacheDir,
         })) { }
 
-        var before = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance).LoadedCount;
+        var before = TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance).LoadedCount;
         Assert.Equal(16, before);
 
         using var result = await BuildAsync(Configure());
         Assert.True(result.Columns > 0);
 
         // The cache is still intact and was not rewritten from scratch.
-        Assert.Equal(16, TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance).LoadedCount);
+        Assert.Equal(16, TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance).LoadedCount);
     }
 
     [Fact]
@@ -821,7 +961,7 @@ public sealed class MosaicBuilderTests : IDisposable
         }
         File.SetLastWriteTimeUtc(victim, DateTime.UtcNow.AddSeconds(5));
 
-        var cache = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance);
+        var cache = TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance);
         Assert.Null(cache.TryGet(new FileInfo(victim)));
 
         // The other five are untouched and still valid.
@@ -839,7 +979,7 @@ public sealed class MosaicBuilderTests : IDisposable
         var cacheDir = Path.Combine(root, "cache-prune");
 
         await BuildToBytesAsync(basePath, tiles, cacheDir);
-        Assert.Equal(10, TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance).LoadedCount);
+        Assert.Equal(10, TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance).LoadedCount);
 
         foreach (var file in Directory.GetFiles(tiles, "*.png").Order().Take(4))
         {
@@ -849,7 +989,7 @@ public sealed class MosaicBuilderTests : IDisposable
         await BuildToBytesAsync(basePath, tiles, cacheDir);
 
         // Entries for removed files must not accumulate forever.
-        Assert.Equal(6, TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance).LoadedCount);
+        Assert.Equal(6, TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance).LoadedCount);
     }
 
     [Fact]
@@ -862,10 +1002,10 @@ public sealed class MosaicBuilderTests : IDisposable
         var expected = await BuildToBytesAsync(basePath, tiles, cacheDir);
 
         // Garbage in the cache must never break a run.
-        var cachePath = TileCache.ResolveCachePath(cacheDir, tiles, 8);
+        var cachePath = TileCache.ResolveCachePath(cacheDir, tiles, new Size(8, 8));
         await File.WriteAllBytesAsync(cachePath, [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02]);
 
-        Assert.Equal(0, TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance).LoadedCount);
+        Assert.Equal(0, TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance).LoadedCount);
         Assert.Equal(expected, await BuildToBytesAsync(basePath, tiles, cacheDir));
     }
 
@@ -877,10 +1017,10 @@ public sealed class MosaicBuilderTests : IDisposable
         var cacheDir = Path.Combine(root, "cache-clear");
 
         await BuildToBytesAsync(basePath, tiles, cacheDir);
-        Assert.True(File.Exists(TileCache.ResolveCachePath(cacheDir, tiles, 8)));
+        Assert.True(File.Exists(TileCache.ResolveCachePath(cacheDir, tiles, new Size(8, 8))));
 
         Assert.True(TileCache.Clear(cacheDir, NullLogger.Instance) > 0);
-        Assert.False(File.Exists(TileCache.ResolveCachePath(cacheDir, tiles, 8)));
+        Assert.False(File.Exists(TileCache.ResolveCachePath(cacheDir, tiles, new Size(8, 8))));
     }
 
     [Fact]
@@ -890,18 +1030,18 @@ public sealed class MosaicBuilderTests : IDisposable
         Directory.CreateDirectory(tiles);
         var cacheDir = Path.Combine(root, "cache-spelling");
 
-        var plain = TileCache.ResolveCachePath(cacheDir, tiles, 16);
+        var plain = TileCache.ResolveCachePath(cacheDir, tiles, new Size(16, 16));
 
         // Trailing separator, different casing and a redundant segment all name the same folder.
-        Assert.Equal(plain, TileCache.ResolveCachePath(cacheDir, tiles + Path.DirectorySeparatorChar, 16));
-        Assert.Equal(plain, TileCache.ResolveCachePath(cacheDir, tiles.ToUpperInvariant(), 16));
-        Assert.Equal(plain, TileCache.ResolveCachePath(cacheDir, Path.Combine(tiles, ".."), 16) is var up && up == plain
+        Assert.Equal(plain, TileCache.ResolveCachePath(cacheDir, tiles + Path.DirectorySeparatorChar, new Size(16, 16)));
+        Assert.Equal(plain, TileCache.ResolveCachePath(cacheDir, tiles.ToUpperInvariant(), new Size(16, 16)));
+        Assert.Equal(plain, TileCache.ResolveCachePath(cacheDir, Path.Combine(tiles, ".."), new Size(16, 16)) is var up && up == plain
             ? plain
-            : TileCache.ResolveCachePath(cacheDir, tiles, 16));
+            : TileCache.ResolveCachePath(cacheDir, tiles, new Size(16, 16)));
 
         // Different folders must not collide.
         var other = Path.Combine(root, "other-tiles");
-        Assert.NotEqual(plain, TileCache.ResolveCachePath(cacheDir, other, 16));
+        Assert.NotEqual(plain, TileCache.ResolveCachePath(cacheDir, other, new Size(16, 16)));
     }
 
     [Fact]
@@ -912,10 +1052,10 @@ public sealed class MosaicBuilderTests : IDisposable
         var cacheDir = Path.Combine(root, "cache-basechange");
 
         await BuildToBytesAsync(CreateQuadrantBaseImage("one.png", 160, 160), tiles, cacheDir);
-        var afterFirst = TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance).LoadedCount;
+        var afterFirst = TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance).LoadedCount;
 
         await BuildToBytesAsync(CreateSolidImage("two.png", 200, 120, new Rgba32(90, 140, 60)), tiles, cacheDir);
-        Assert.Equal(afterFirst, TileCache.Open(cacheDir, tiles, 8, NullLogger.Instance).LoadedCount);
+        Assert.Equal(afterFirst, TileCache.Open(cacheDir, tiles, new Size(8, 8), NullLogger.Instance).LoadedCount);
     }
 
     private async Task<byte[]> BuildToBytesAsync(
@@ -934,6 +1074,10 @@ public sealed class MosaicBuilderTests : IDisposable
             // 10x10 grid. Opted out explicitly because the constraint is never relaxed for anyone —
             // a test that does not care about placement has to say so.
             RepeatAvoidanceRadius = 0,
+
+            // Same for the no-reuse default: 12 tiles cannot cover 100 cells once each. These
+            // fixtures are about what the cache stores and returns, not about placement.
+            MaxTileReuse = 0,
         });
 
         using var stream = new MemoryStream();
@@ -956,8 +1100,10 @@ public sealed class MosaicBuilderTests : IDisposable
         var tiles = CreateTileFolder("tiles", 12);
         var output = Path.Combine(root, "aliased.png");
 
-        // -d 0: this asserts alias plumbing, and 12 tiles cannot satisfy the default repeat distance.
-        var exitCode = await RunCliAsync([basePath, tiles, "-n", "12", "-s", "8", "-o", output, "-f", "-d", "0"]);
+        // -d 0 -r 0: this asserts alias plumbing, and 12 tiles can neither satisfy the default repeat
+        // distance nor cover 144 cells without reuse.
+        var exitCode = await RunCliAsync(
+            [basePath, tiles, "-n", "12", "-s", "8", "-o", output, "-f", "-d", "0", "-r", "0"]);
 
         Assert.Equal(0, exitCode);
         Assert.True(File.Exists(output), "The -o alias should have produced this file.");
@@ -975,15 +1121,15 @@ public sealed class MosaicBuilderTests : IDisposable
         var viaAlias = Path.Combine(root, "alias.png");
         var viaConfigKey = Path.Combine(root, "config.png");
 
-        // Repeat distance off on both sides: 12 tiles cannot satisfy the default, and what is under
-        // test is that the two spellings reach the same options, not how tiles are placed.
+        // Repeat distance and the reuse cap off on both sides: 12 tiles satisfy neither default, and
+        // what is under test is that the two spellings reach the same options, not how tiles are placed.
         Assert.Equal(0, await RunCliAsync(
             [basePath, tiles, "--tiles-across", "10", "--tile-size", "8", "--output", viaAlias, "-f",
-             "--repeat-distance", "0"]));
+             "--repeat-distance", "0", "--max-reuse", "0"]));
         Assert.Equal(0, await RunCliAsync(
             [basePath, tiles, "--Mosaic:TilesAcross=10", "--Mosaic:TileSize=8",
              $"--Mosaic:OutputPath={viaConfigKey}", "--Mosaic:Overwrite=true",
-             "--Mosaic:RepeatAvoidanceRadius=0"]));
+             "--Mosaic:RepeatAvoidanceRadius=0", "--Mosaic:MaxTileReuse=0"]));
 
         Assert.Equal(await File.ReadAllBytesAsync(viaAlias), await File.ReadAllBytesAsync(viaConfigKey));
     }

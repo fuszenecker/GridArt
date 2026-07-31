@@ -15,11 +15,11 @@ public static class CommandLine
 
         Options:
           -o, --output <path>            Output file (default: <base-image>.mosaic.png)
-          -n, --tiles-across <n>         Tiles along the long axis (default 64)
-          -s, --tile-size <px>           Pixels per tile (default 48)
+          -n, --tiles-across <n>         Tiles per axis; the grid is n x n (default 64)
+          -s, --tile-size <px>           Pixels along a tile's longer edge (default 48)
           -g, --signature-grid <n>       Match patches per axis, 1-16 (default 3)
           -c, --color-adjust <0-1>       Tint tiles toward the base image (default 0 = off)
-          -r, --max-reuse <n>            Max placements per image, 0 = unlimited (default 0)
+          -r, --max-reuse <n>            Max placements per image, 0 = unlimited (default 1)
           -d, --repeat-distance <n>      Cells that must separate two uses of one image (default 2)
               --recursive <bool>         Scan subfolders (default true)
           -f, --overwrite                Replace an existing output file
@@ -35,10 +35,22 @@ public static class CommandLine
         The cache is keyed on the tiles folder and --tile-size only, so changing any other option
         still hits the cache.
 
+        Tiles are shaped like the base image, not square: --tile-size sets the longer edge and the
+        shorter one follows the base image's aspect ratio. The grid is therefore square — the output
+        measures (n x cell width) by (n x cell height), so base-shaped cells on a square grid are what
+        make the mosaic itself base-shaped. Square tiles would centre-crop every photo to a square.
+
+        No image is reused by default (--max-reuse 1), so the folder needs at least as many images as
+        the grid has cells: 64 x 64 is 4,096 photos. A folder that is too small fails up front, saying
+        what would fit — it never quietly places the same photo twice. --max-reuse 0 allows unlimited
+        reuse, --max-reuse N caps it at N.
+
         --repeat-distance is absolute: no two cells within that many cells of each other ever get the
         same image. It is never relaxed. If the folder holds too few images for the grid, the run
         fails up front saying how many are needed — add more images, lower --repeat-distance, or
-        lower --tiles-across.
+        lower --tiles-across. It is a local radius, so it constrains nothing the default --max-reuse 1
+        does not already forbid outright; it matters only once you allow reuse with --max-reuse 0 or N,
+        where it is what keeps a repeat away from its twin.
 
         Source images are reproduced with their own colours. Nothing tints, brightens or recolours a
         tile unless you pass --color-adjust above 0.

@@ -67,11 +67,32 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
             logger.LogInformation("Cleared {Count} cache file(s).", removed);
         }
 
-        // Reading and analysing the base image is independent of loading the tiles: the cell signatures
-        // depend only on the base image, and the cached/resized tiles only on TileSize. Both are slow,
-        // so they run concurrently instead of one after the other. Started before the cache is opened so
-        // that reading a multi-gigabyte cache file overlaps the base-image work too.
-        var baseTask = AnalyseBaseAsync(options, progress, cancellationToken);
+        // Tiles are cropped to the cell shape, which follows the base image's aspect ratio, so loading
+        // cannot start until the base dimensions are known. Only the *dimensions* though — that is a
+        // header read of a few hundred bytes, not a decode — so the expensive part of the base work
+        // still overlaps loading, as below.
+        Size baseSize;
+        using (progress.Begin("Reading base image size"))
+        {
+            var info = await Image.IdentifyAsync(options.BaseImage, cancellationToken);
+            baseSize = info.Size;
+        }
+
+        var (columns, rows) = ResolveGrid(baseSize, options.TilesAcross);
+        var cellSize = ResolveTileSize(baseSize, options.TileSize);
+        var cellCount = (long)columns * rows;
+
+        logger.LogInformation(
+            "Base image {Path} is {Width}x{Height}.", options.BaseImage, baseSize.Width, baseSize.Height);
+        logger.LogInformation(
+            "Grid {Columns}x{Rows} = {Cells} cells of {CellW}x{CellH}; output {OutWidth}x{OutHeight}.",
+            columns, rows, cellCount, cellSize.Width, cellSize.Height,
+            columns * cellSize.Width, rows * cellSize.Height);
+
+        // Decoding the base image and computing its cell signatures is independent of loading the tiles,
+        // and both are slow, so they run concurrently instead of one after the other. Started before the
+        // cache is opened so that reading a multi-gigabyte cache file overlaps the base-image work too.
+        var baseTask = AnalyseBaseAsync(options, columns, rows, cellSize, progress, cancellationToken);
 
         TileCache? cache = null;
         BaseAnalysis? analysis = null;
@@ -79,16 +100,16 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
 
         try
         {
-            // Keyed on the tiles folder and TileSize only — the two things the cached pixels depend on.
+            // Keyed on the tiles folder and the cell size — the things the cached pixels depend on.
             cache = options.NoCache
                 ? null
-                : TileCache.Open(options.CacheDirectory, options.TilesFolder, options.TileSize, logger);
+                : TileCache.Open(options.CacheDirectory, options.TilesFolder, cellSize, logger);
 
-            var stages = StageWriter.Create(options, baseTask, logger, progress);
+            var stages = StageWriter.Create(options, baseTask, cellSize, logger, progress);
 
             var libraryTask = TileLibrary.LoadAsync(
                 options.TilesFolder,
-                new Size(options.TileSize, options.TileSize),
+                cellSize,
                 options.SignatureGrid,
                 options.Recursive,
                 logger,
@@ -116,9 +137,6 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                 }
             }
 
-            var columns = analysis!.Columns;
-            var rows = analysis.Rows;
-            var cellCount = (long)columns * rows;
             var tiles = library!.Tiles;
 
             if (options.MaxTileReuse > 0)
@@ -126,10 +144,18 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                 var capacity = (long)tiles.Count * options.MaxTileReuse;
                 if (capacity < cellCount)
                 {
+                    // Phrased for the default case first, because that is the one people hit: "no reuse"
+                    // simply needs one image per cell, and the fix is usually a smaller --tiles-across
+                    // rather than more photos.
+                    var limit = options.MaxTileReuse == 1
+                        ? "each image is used at most once (--max-reuse 1, the default)"
+                        : $"--max-reuse {options.MaxTileReuse}";
+
                     throw new InvalidOperationException(
-                        $"{tiles.Count} tile(s) with MaxTileReuse={options.MaxTileReuse} can fill only " +
-                        $"{capacity} of {cellCount} cells. Add more images, raise MaxTileReuse " +
-                        "(0 = unlimited), or lower TilesAcross.");
+                        $"A {columns}x{rows} grid needs {cellCount:N0} cells, but with {limit} the " +
+                        $"{tiles.Count:N0} image(s) loaded can fill only {capacity:N0}. Add more images, " +
+                        $"lower --tiles-across (about {LargestGridWithin(baseSize, tiles.Count, options.MaxTileReuse)} " +
+                        "would fit), raise --max-reuse, or pass --max-reuse 0 to allow unlimited reuse.");
                 }
             }
 
@@ -149,8 +175,10 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
             int[] assignment;
             using (var phase = progress.Begin("Matching tiles", cellCount, "cells"))
             {
+                // analysis! for the same reason as library! above: Task.WhenAll returned without
+                // throwing, so both tasks completed and the finally assigned both.
                 assignment = Assign(
-                    analysis.CellSignatures, tiles, columns, rows,
+                    analysis!.CellSignatures, tiles, columns, rows,
                     options.RepeatAvoidanceRadius, options.MaxTileReuse,
                     phase, cancellationToken);
             }
@@ -160,7 +188,7 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
             Image<Rgba32> mosaic;
             using (var phase = progress.Begin("Rendering mosaic", cellCount, "tiles"))
             {
-                mosaic = Render(assignment, tiles, columns, rows, options.TileSize, phase, cancellationToken);
+                mosaic = Render(assignment, tiles, columns, rows, cellSize, phase, cancellationToken);
             }
 
             try
@@ -220,7 +248,12 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
     }
 
     private async Task<BaseAnalysis> AnalyseBaseAsync(
-        MosaicOptions options, IProgressReporter progress, CancellationToken cancellationToken)
+        MosaicOptions options,
+        int columns,
+        int rows,
+        Size cellSize,
+        IProgressReporter progress,
+        CancellationToken cancellationToken)
     {
         Image<Rgba32> baseImage;
         using (progress.Begin("Reading base image"))
@@ -230,16 +263,7 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
 
         try
         {
-            logger.LogInformation(
-                "Base image {Path} is {Width}x{Height}.",
-                options.BaseImage, baseImage.Width, baseImage.Height);
-
-            var (columns, rows) = ResolveGrid(baseImage.Size, options.TilesAcross);
-            var outputSize = new Size(columns * options.TileSize, rows * options.TileSize);
-
-            logger.LogInformation(
-                "Grid {Columns}x{Rows} = {Cells} cells; output {OutWidth}x{OutHeight}.",
-                columns, rows, columns * rows, outputSize.Width, outputSize.Height);
+            var outputSize = new Size(columns * cellSize.Width, rows * cellSize.Height);
 
             // The base image is resampled to the exact output size once; the per-pixel colour-adjust
             // step then has a matching target pixel for every mosaic pixel, so tinting can follow
@@ -284,21 +308,43 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
     }
 
     /// <summary>
-    /// Lays <paramref name="tilesAcross"/> tiles along the longer axis and scales the other axis to
-    /// preserve the aspect ratio, so the mosaic is never stretched relative to the base image.
+    /// The cell grid: <paramref name="tilesAcross"/> tiles on each axis.
     /// </summary>
-    internal static (int Columns, int Rows) ResolveGrid(Size baseSize, int tilesAcross)
-    {
-        if (baseSize.Width >= baseSize.Height)
-        {
-            var columns = tilesAcross;
-            var rows = Math.Max(1, (int)Math.Round(tilesAcross * (double)baseSize.Height / baseSize.Width));
-            return (columns, rows);
-        }
+    /// <remarks>
+    /// <para>
+    /// <b>The grid is square and the cells are not.</b> That is the only way to give each tile the base
+    /// image's aspect ratio, and the arithmetic forces the choice: the output measures
+    /// <c>columns · cellWidth</c> by <c>rows · cellHeight</c>, so demanding both that the output match
+    /// the base ratio and that <c>cellWidth : cellHeight</c> match it too leaves
+    /// <c>columns : rows == 1 : 1</c>. Aspect ratio lives in the cell shape, not in the cell counts.
+    /// </para>
+    /// <para>
+    /// It used to be the other way round: a proportional grid of square cells, which also produced a
+    /// correctly-proportioned output — but every source photo was then centre-cropped to a square,
+    /// throwing away the sides of every landscape shot and the top and bottom of every portrait one. The
+    /// mosaic was right in outline and wrong in every tile.
+    /// </para>
+    /// </remarks>
+    internal static (int Columns, int Rows) ResolveGrid(Size baseSize, int tilesAcross) =>
+        (tilesAcross, tilesAcross);
 
-        var r = tilesAcross;
-        var c = Math.Max(1, (int)Math.Round(tilesAcross * (double)baseSize.Width / baseSize.Height));
-        return (c, r);
+    /// <summary>
+    /// Shape of one cell: <paramref name="tileSize"/> on the longer edge, the shorter edge scaled to the
+    /// base image's aspect ratio, so a tile is a miniature of the base image's shape.
+    /// </summary>
+    /// <remarks>
+    /// On a 4:3 base a 4:3 photo now fits with no crop at all, where a square cell cost it a quarter of
+    /// its width. Taken straight from the base dimensions rather than from the grid: with a square grid
+    /// the cell ratio *is* the base ratio, and going via the grid would only reintroduce rounding.
+    /// The short edge is clamped to 1px so an extreme panorama cannot round it to zero.
+    /// </remarks>
+    internal static Size ResolveTileSize(Size baseSize, int tileSize)
+    {
+        var ratio = (double)baseSize.Width / baseSize.Height;
+
+        return ratio >= 1d
+            ? new Size(tileSize, Math.Max(1, (int)Math.Round(tileSize / ratio)))
+            : new Size(Math.Max(1, (int)Math.Round(tileSize * ratio)), tileSize);
     }
 
     private static ColorSignature[] ComputeCellSignatures(
@@ -520,6 +566,35 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
     }
 
     /// <summary>
+    /// Largest <c>--tiles-across</c> whose grid still fits in the images available, so the error can
+    /// name a value that works instead of only saying "lower it".
+    /// </summary>
+    /// <remarks>
+    /// Goes through <see cref="ResolveGrid"/> rather than computing a square root directly, so it stays
+    /// correct if the grid shape ever changes again: the number printed in an error must be one that
+    /// actually works on the next run.
+    /// </remarks>
+    internal static int LargestGridWithin(Size baseSize, int tileCount, int maxTileReuse)
+    {
+        var capacity = maxTileReuse <= 0 ? long.MaxValue : (long)tileCount * maxTileReuse;
+
+        // Start from the square root of the capacity — the answer for a square grid — and walk down.
+        // Bounded and cheap; a linear scan from tileCount would be up to 4096 iterations for nothing.
+        var start = Math.Clamp((int)Math.Sqrt(capacity) + 1, 1, 4096);
+
+        for (var across = start; across >= 1; across--)
+        {
+            var (c, r) = ResolveGrid(baseSize, across);
+            if ((long)c * r <= capacity)
+            {
+                return across;
+            }
+        }
+
+        return 1;
+    }
+
+    /// <summary>
     /// Whether <paramref name="tileIndex"/> already sits within <paramref name="radius"/> cells of
     /// (<paramref name="col"/>, <paramref name="row"/>).
     /// </summary>
@@ -568,24 +643,25 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
         IReadOnlyList<Tile> tiles,
         int columns,
         int rows,
-        int tileSize,
+        Size cellSize,
         IProgressPhase? phase = null,
         CancellationToken cancellationToken = default)
     {
-        var mosaic = new Image<Rgba32>(columns * tileSize, rows * tileSize);
+        var mosaic = new Image<Rgba32>(columns * cellSize.Width, rows * cellSize.Height);
         try
         {
             Parallel.For(0, rows, CpuBound(cancellationToken), row =>
             {
-                for (var line = 0; line < tileSize; line++)
+                for (var line = 0; line < cellSize.Height; line++)
                 {
-                    var target = mosaic.Frames.RootFrame.DangerousGetPixelRowMemory(row * tileSize + line).Span;
+                    var target = mosaic.Frames.RootFrame
+                        .DangerousGetPixelRowMemory(row * cellSize.Height + line).Span;
 
                     for (var col = 0; col < columns; col++)
                     {
                         var tile = tiles[assignment[row * columns + col]];
                         tile.Pixels.Frames.RootFrame.DangerousGetPixelRowMemory(line).Span
-                            .CopyTo(target.Slice(col * tileSize, tileSize));
+                            .CopyTo(target.Slice(col * cellSize.Width, cellSize.Width));
                     }
                 }
 
@@ -714,7 +790,7 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
     {
         private readonly StageSchedule schedule;
         private readonly Task<BaseAnalysis> baseTask;
-        private readonly int tileSize;
+        private readonly Size cellSize;
         private readonly float colorAdjustStrength;
         private readonly int repeatAvoidanceRadius;
         private readonly int maxTileReuse;
@@ -726,12 +802,13 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
         private StageWriter(
             MosaicOptions options,
             Task<BaseAnalysis> baseTask,
+            Size cellSize,
             ILogger logger,
             IProgressReporter progress)
         {
             schedule = new StageSchedule(TimeSpan.FromSeconds(options.StageIntervalSeconds));
             this.baseTask = baseTask;
-            tileSize = options.TileSize;
+            this.cellSize = cellSize;
             colorAdjustStrength = (float)options.ColorAdjustStrength;
             repeatAvoidanceRadius = options.RepeatAvoidanceRadius;
             maxTileReuse = options.MaxTileReuse;
@@ -754,6 +831,7 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
         public static ITileStageWriter? Create(
             MosaicOptions options,
             Task<BaseAnalysis> baseTask,
+            Size cellSize,
             ILogger logger,
             IProgressReporter progress)
         {
@@ -762,7 +840,7 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                 return null;
             }
 
-            return new StageWriter(options, baseTask, logger, progress);
+            return new StageWriter(options, baseTask, cellSize, logger, progress);
         }
 
         public async Task<bool> TryWriteAsync(
@@ -821,7 +899,7 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                         phase: null, cancellationToken);
 
                     using var mosaic = Render(
-                        assignment, tiles, analysis.Columns, analysis.Rows, tileSize,
+                        assignment, tiles, analysis.Columns, analysis.Rows, cellSize,
                         phase: null, cancellationToken);
 
                     if (colorAdjustStrength > 0f)
