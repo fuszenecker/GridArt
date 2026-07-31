@@ -272,6 +272,272 @@ public sealed class MosaicBuilderTests : IDisposable
     }
 
     [Fact]
+    public void Space_separated_option_values_are_not_taken_as_positional_arguments()
+    {
+        // The regression this guards: "out.png" must not become the base image.
+        var (positional, remaining) = CommandLine.Parse(
+            ["-o", "out.png", "base.png", "tiles"]);
+
+        Assert.Equal("base.png", positional["Mosaic:BaseImage"]);
+        Assert.Equal("tiles", positional["Mosaic:TilesFolder"]);
+        Assert.Equal(["-o", "out.png"], remaining);
+    }
+
+    [Fact]
+    public void Bare_boolean_flags_are_expanded_to_an_explicit_value()
+    {
+        var (_, remaining) = CommandLine.Parse(["base.png", "tiles", "-f"]);
+        Assert.Equal(["-f=true"], remaining);
+
+        // An explicit value must survive untouched.
+        var (_, explicitValue) = CommandLine.Parse(["base.png", "tiles", "--overwrite=false"]);
+        Assert.Equal(["--overwrite=false"], explicitValue);
+    }
+
+    [Theory]
+    [InlineData("-n", "Mosaic:TilesAcross")]
+    [InlineData("--tiles-across", "Mosaic:TilesAcross")]
+    [InlineData("-s", "Mosaic:TileSize")]
+    [InlineData("-o", "Mosaic:OutputPath")]
+    [InlineData("-c", "Mosaic:ColorAdjustStrength")]
+    [InlineData("-d", "Mosaic:RepeatAvoidanceRadius")]
+    [InlineData("--recursive", "Mosaic:Recursive")]
+    [InlineData("-f", "Mosaic:Overwrite")]
+    public void Aliases_target_the_expected_configuration_keys(string alias, string expectedKey)
+    {
+        Assert.Equal(expectedKey, CommandLine.SwitchMappings[alias]);
+    }
+
+    [Fact]
+    public void Every_option_has_a_long_alias()
+    {
+        // Guards against a property being added to MosaicOptions without an alias entry.
+        var optionNames = typeof(MosaicOptions)
+            .GetProperties()
+            .Select(p => p.Name)
+            .Except([nameof(MosaicOptions.BaseImage), nameof(MosaicOptions.TilesFolder)])
+            .ToArray();
+
+        var mapped = CommandLine.SwitchMappings.Values
+            .Select(v => v.Split(':')[1])
+            .ToHashSet();
+
+        Assert.DoesNotContain(optionNames, n => !mapped.Contains(n));
+    }
+
+    [Theory]
+    [InlineData("-Z", "9")]      // silently ignored by the provider, so checked explicitly
+    [InlineData("-Z=9", null)]   // the provider would throw on this one
+    [InlineData("--nope", "1")]
+    public void Unknown_switches_are_detected(string flag, string? value)
+    {
+        string[] args = value is null
+            ? ["base.png", "tiles", flag]
+            : ["base.png", "tiles", flag, value];
+
+        Assert.Equal(flag.Split('=')[0], CommandLine.FindUnknownSwitch(args));
+    }
+
+    [Theory]
+    [InlineData("/tmp/nested/base.png")]      // MSYS / Git Bash style
+    [InlineData("/c/photos/base.png")]
+    [InlineData("/mnt/d/pictures/base.png")]
+    [InlineData("/base.png")]
+    public void Slash_prefixed_paths_are_treated_as_paths_not_options(string path)
+    {
+        // Regression: these were read as Windows "/switch" options, so a valid path was rejected as
+        // an unknown option and the worker printed its usage instead of building anything.
+        Assert.Null(CommandLine.FindUnknownSwitch([path, "/tmp/nested/tiles"]));
+
+        var (positional, remaining) = CommandLine.Parse([path, "/tmp/nested/tiles"]);
+        Assert.Equal(path, positional["Mosaic:BaseImage"]);
+        Assert.Equal("/tmp/nested/tiles", positional["Mosaic:TilesFolder"]);
+        Assert.Empty(remaining);
+    }
+
+    [Fact]
+    public void Windows_slash_switches_still_work()
+    {
+        // Dropping '/' handling entirely would have been the lazy fix; these must keep working.
+        Assert.Null(CommandLine.FindUnknownSwitch(["base.png", "tiles", "/Mosaic:TilesAcross=20"]));
+
+        var (_, remaining) = CommandLine.Parse(["base.png", "tiles", "/Mosaic:TilesAcross=20"]);
+        Assert.Contains("/Mosaic:TilesAcross=20", remaining);
+    }
+
+    [Fact]
+    public async Task Slash_prefixed_path_actually_builds_a_mosaic()
+    {
+        // End-to-end proof, using a real path that starts with a separator.
+        var basePath = CreateQuadrantBaseImage("base.png", 200, 200);
+        var tiles = CreateTileFolder("tiles", 10);
+
+        // Strip the drive letter to get a rooted, slash-leading path to the same file.
+        var rootedBase = '/' + Path.GetRelativePath(Path.GetPathRoot(basePath)!, basePath).Replace('\\', '/');
+        var rootedTiles = '/' + Path.GetRelativePath(Path.GetPathRoot(tiles)!, tiles).Replace('\\', '/');
+
+        Assert.Null(CommandLine.FindUnknownSwitch([rootedBase, rootedTiles]));
+
+        var output = Path.Combine(root, "rooted.png");
+        var exitCode = await RunCliAsync([rootedBase, rootedTiles, "-n", "8", "-s", "8", "-o", output, "-f"]);
+
+        Assert.Equal(0, exitCode);
+        Assert.True(File.Exists(output), "A slash-prefixed path should have produced a mosaic.");
+    }
+
+    [Fact]
+    public async Task Tiles_in_nested_subfolders_are_all_found()
+    {
+        var basePath = CreateQuadrantBaseImage("base.png", 160, 160);
+        var nested = Path.Combine(root, "nested");
+
+        // 6 tiles spread three levels deep.
+        foreach (var (sub, count) in new[] { ("a", 2), (Path.Combine("a", "deep"), 2), ("b", 2) })
+        {
+            var folder = Path.Combine(nested, sub);
+            Directory.CreateDirectory(folder);
+            for (var i = 0; i < count; i++)
+            {
+                using var tile = new Image<Rgba32>(32, 32, Palette[(i + sub.Length) % Palette.Length]);
+                tile.Save(Path.Combine(folder, $"t{i}.png"));
+            }
+        }
+
+        using var recursive = await BuildAsync(new MosaicOptions
+        {
+            BaseImage = basePath,
+            TilesFolder = nested,
+            TilesAcross = 8,
+            TileSize = 8,
+            RepeatAvoidanceRadius = 0,
+        });
+        Assert.True(recursive.Quality.DistinctTiles > 2, "Recursive scan should reach nested folders.");
+
+        // With Recursive off, the top-level folder holds no images at all, which must be a clear error.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => BuildAsync(new MosaicOptions
+        {
+            BaseImage = basePath,
+            TilesFolder = nested,
+            TilesAcross = 8,
+            TileSize = 8,
+            Recursive = false,
+        }));
+        Assert.Contains("No supported images", ex.Message);
+    }
+
+    [Fact]
+    public async Task Missing_argument_errors_name_the_argument_and_echo_what_was_received()
+    {
+        var basePath = CreateQuadrantBaseImage("base.png", 100, 100);
+
+        var (exit, output) = await RunCliCapturingErrorAsync([basePath]);
+
+        Assert.Equal(1, exit);
+        Assert.Contains("Missing the tiles folder", output);
+        // Echoing the arguments back is what makes a swallowed path diagnosable.
+        Assert.Contains(basePath, output);
+    }
+
+    [Fact]
+    public void Known_switches_and_configuration_keys_pass_validation()
+    {
+        Assert.Null(CommandLine.FindUnknownSwitch(
+            ["base.png", "tiles", "-n", "40", "--tile-size=16", "-f",
+             "--Mosaic:ColorAdjustStrength=0.5", "--help"]));
+    }
+
+    [Fact]
+    public async Task Short_aliases_drive_a_real_run()
+    {
+        var basePath = CreateQuadrantBaseImage("base.png", 240, 240);
+        var tiles = CreateTileFolder("tiles", 12);
+        var output = Path.Combine(root, "aliased.png");
+
+        var exitCode = await RunCliAsync([basePath, tiles, "-n", "12", "-s", "8", "-o", output, "-f"]);
+
+        Assert.Equal(0, exitCode);
+        Assert.True(File.Exists(output), "The -o alias should have produced this file.");
+
+        using var image = await Image.LoadAsync<Rgba32>(output);
+        Assert.Equal(96, image.Width);  // -n 12 x -s 8
+        Assert.Equal(96, image.Height);
+    }
+
+    [Fact]
+    public async Task Long_and_configuration_style_options_are_equivalent()
+    {
+        var basePath = CreateQuadrantBaseImage("base.png", 240, 240);
+        var tiles = CreateTileFolder("tiles", 12);
+        var viaAlias = Path.Combine(root, "alias.png");
+        var viaConfigKey = Path.Combine(root, "config.png");
+
+        Assert.Equal(0, await RunCliAsync(
+            [basePath, tiles, "--tiles-across", "10", "--tile-size", "8", "--output", viaAlias, "-f"]));
+        Assert.Equal(0, await RunCliAsync(
+            [basePath, tiles, "--Mosaic:TilesAcross=10", "--Mosaic:TileSize=8",
+             $"--Mosaic:OutputPath={viaConfigKey}", "--Mosaic:Overwrite=true"]));
+
+        Assert.Equal(await File.ReadAllBytesAsync(viaAlias), await File.ReadAllBytesAsync(viaConfigKey));
+    }
+
+    [Fact]
+    public async Task Unknown_single_dash_switch_reports_usage_instead_of_crashing()
+    {
+        var basePath = CreateQuadrantBaseImage("base.png", 120, 120);
+        var tiles = CreateTileFolder("tiles", 8);
+
+        var (exitCode, stderr) = await RunCliCapturingErrorAsync([basePath, tiles, "-Z", "9"]);
+
+        Assert.Equal(1, exitCode);
+        Assert.Contains("Usage: gridart", stderr);
+    }
+
+    [Fact]
+    public async Task Missing_arguments_and_help_are_distinguished()
+    {
+        var (noArgsExit, noArgsErr) = await RunCliCapturingErrorAsync([]);
+        Assert.Equal(1, noArgsExit);
+        Assert.Contains("Usage: gridart", noArgsErr);
+
+        Assert.Equal(0, await RunCliAsync(["--help"]));
+    }
+
+    /// <summary>
+    /// Runs the built worker as a real process, which is the only way to exercise Program.cs —
+    /// configuration wiring and alias handling live there, not in an injectable service.
+    /// </summary>
+    private static async Task<int> RunCliAsync(string[] args) =>
+        (await RunCliCapturingErrorAsync(args)).ExitCode;
+
+    private static async Task<(int ExitCode, string StandardError)> RunCliCapturingErrorAsync(string[] args)
+    {
+        var assemblyPath = typeof(MosaicOptions).Assembly.Location;
+
+        var startInfo = new System.Diagnostics.ProcessStartInfo("dotnet")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+
+        startInfo.ArgumentList.Add(assemblyPath);
+        foreach (var arg in args)
+        {
+            startInfo.ArgumentList.Add(arg);
+        }
+
+        using var process = System.Diagnostics.Process.Start(startInfo)
+            ?? throw new InvalidOperationException("Failed to start the worker process.");
+
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+
+        // Usage goes to stderr, but --help goes to stdout; searching both keeps the helpers simple.
+        return (process.ExitCode, await stderr + await stdout);
+    }
+
+    [Fact]
     public void Signature_distance_is_zero_for_identical_regions_and_grows_with_difference()
     {
         using var red = new Image<Rgba32>(20, 20, new Rgba32(200, 40, 40));
