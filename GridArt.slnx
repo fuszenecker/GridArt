@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/gridart.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/gridart.Tests/gridart.Tests.csproj" />
+  </Folder>
+</Solution>
