@@ -1,4 +1,5 @@
 using gridart.Imaging;
+using gridart.Progress;
 using Microsoft.Extensions.Options;
 using SixLabors.ImageSharp;
 
@@ -11,6 +12,7 @@ namespace gridart;
 public sealed class Worker(
     IOptions<MosaicOptions> options,
     MosaicBuilder builder,
+    IProgressReporter progress,
     IHostApplicationLifetime lifetime,
     ILogger<Worker> logger) : BackgroundService
 {
@@ -32,7 +34,7 @@ public sealed class Worker(
                     "or choose another --Mosaic:OutputPath.");
             }
 
-            using var result = await builder.BuildAsync(mosaicOptions, stoppingToken);
+            using var result = await builder.BuildAsync(mosaicOptions, stoppingToken, progress);
 
             var directory = Path.GetDirectoryName(outputPath);
             if (!string.IsNullOrEmpty(directory))
@@ -40,11 +42,16 @@ public sealed class Worker(
                 Directory.CreateDirectory(directory);
             }
 
-            await result.Image.SaveAsync(outputPath, stoppingToken);
+            // Encoding a large PNG is slow enough to look like a hang without a phase of its own.
+            using (progress.Begin($"Saving {Path.GetFileName(outputPath)}"))
+            {
+                await result.Image.SaveAsync(outputPath, stoppingToken);
+            }
 
+            var sizeMb = new FileInfo(outputPath).Length / (1024d * 1024d);
             logger.LogInformation(
-                "Wrote {Path} ({Width}x{Height}).",
-                outputPath, result.Image.Width, result.Image.Height);
+                "Wrote {Path} ({Width}x{Height}, {Size:0.0} MB).",
+                outputPath, result.Image.Width, result.Image.Height, sizeMb);
 
             Environment.ExitCode = 0;
         }

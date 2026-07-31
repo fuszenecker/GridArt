@@ -84,6 +84,9 @@ public sealed class MosaicOptions
     /// <summary>Deletes all cache files before running.</summary>
     public bool ClearCache { get; set; }
 
+    /// <summary>Suppresses progress output. Errors and warnings are still logged.</summary>
+    public bool Quiet { get; set; }
+
     /// <summary>Overwrite <see cref="OutputPath"/> if it already exists.</summary>
     public bool Overwrite { get; set; }
 

@@ -1,5 +1,7 @@
 using gridart;
 using gridart.Imaging;
+using gridart.Progress;
+using Microsoft.Extensions.Options;
 
 if (CommandLine.WantsHelp(args))
 {
@@ -60,6 +62,23 @@ builder.Services
     .AddOptions<MosaicOptions>()
     .Bind(section)
     .ValidateDataAnnotations();
+
+// One line per message instead of the default two, and no category/event-id noise: this is a CLI, so
+// the log is the user interface.
+builder.Logging.ClearProviders();
+builder.Logging.AddSimpleConsole(o =>
+{
+    o.SingleLine = true;
+    o.IncludeScopes = false;
+    o.TimestampFormat = null;
+});
+
+// Progress goes through ILogger like everything else, so --quiet, log-level filters and any extra
+// provider apply to it uniformly.
+builder.Services.AddSingleton<IProgressReporter>(sp =>
+    sp.GetRequiredService<IOptions<MosaicOptions>>().Value.Quiet
+        ? NullProgressReporter.Instance
+        : new LoggingProgressReporter(sp.GetRequiredService<ILogger<LoggingProgressReporter>>()));
 
 builder.Services.AddSingleton<MosaicBuilder>();
 builder.Services.AddHostedService<Worker>();

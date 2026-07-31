@@ -26,6 +26,7 @@ public static class CommandLine
               --no-cache                 Skip the decoded-tile cache for this run
               --cache-dir <path>         Cache location (default: %LOCALAPPDATA%\GridArt\cache)
               --clear-cache              Delete all cache files before running
+          -q, --quiet                    Suppress progress output
           -h, --help                     Show this help
 
         Decoded, cell-sized tiles are cached on disk and reused when a source file's size and
@@ -52,7 +53,7 @@ public static class CommandLine
     /// <c>--overwrite</c> is expanded before parsing.
     /// </summary>
     private static readonly string[] BooleanFlags =
-        ["-f", "--overwrite", "--no-cache", "--clear-cache"];
+        ["-f", "--overwrite", "--no-cache", "--clear-cache", "-q", "--quiet"];
 
     private static Dictionary<string, string> BuildSwitchMappings()
     {
@@ -82,6 +83,7 @@ public static class CommandLine
         Map(nameof(MosaicOptions.NoCache), "", "--no-cache");
         Map(nameof(MosaicOptions.CacheDirectory), "", "--cache-dir");
         Map(nameof(MosaicOptions.ClearCache), "", "--clear-cache");
+        Map(nameof(MosaicOptions.Quiet), "-q", "--quiet");
 
         return mappings;
     }

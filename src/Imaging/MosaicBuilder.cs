@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using gridart.Progress;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
@@ -47,11 +48,20 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
 
     public async Task<MosaicResult> BuildAsync(
         MosaicOptions options,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IProgressReporter? progress = null)
     {
+        progress ??= NullProgressReporter.Instance;
         var stopwatch = Stopwatch.StartNew();
 
-        using var baseImage = await Image.LoadAsync<Rgba32>(options.BaseImage, cancellationToken);
+        Image<Rgba32> baseImage;
+        using (progress.Begin("Reading base image"))
+        {
+            baseImage = await Image.LoadAsync<Rgba32>(options.BaseImage, cancellationToken);
+        }
+
+        using var _ = baseImage;
+
         logger.LogInformation(
             "Base image {Path} is {Width}x{Height}.",
             options.BaseImage, baseImage.Width, baseImage.Height);
@@ -77,7 +87,7 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
 
         using var library = await TileLibrary.LoadAsync(
             options.TilesFolder, cellSize, options.SignatureGrid, options.Recursive, logger,
-            cancellationToken, cache);
+            cancellationToken, cache, progress);
 
         if (options.MaxTileReuse > 0)
         {
@@ -94,27 +104,56 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
         // The base image is resampled to the exact output size once; the per-pixel colour-adjust step
         // then has a matching target pixel for every mosaic pixel, so tinting can follow gradients
         // inside a cell instead of pushing the whole cell toward one flat colour.
-        using var baseAtOutputScale = baseImage.Clone(ctx => ctx.Resize(new ResizeOptions
+        Image<Rgba32> baseAtOutputScale;
+        using (progress.Begin("Rescaling base image"))
         {
-            Size = outputSize,
-            Mode = ResizeMode.Stretch,
-            Sampler = KnownResamplers.Lanczos3,
-        }));
+            baseAtOutputScale = baseImage.Clone(ctx => ctx.Resize(new ResizeOptions
+            {
+                Size = outputSize,
+                Mode = ResizeMode.Stretch,
+                Sampler = KnownResamplers.Lanczos3,
+            }));
+        }
 
-        var cellSignatures = ComputeCellSignatures(baseImage, columns, rows, options.SignatureGrid);
-        var assignment = Assign(cellSignatures, library, columns, rows, options);
+        using var __ = baseAtOutputScale;
+
+        var cellCount = (long)columns * rows;
+
+        ColorSignature[] cellSignatures;
+        using (var phase = progress.Begin("Analysing base image", cellCount, "cells"))
+        {
+            cellSignatures = ComputeCellSignatures(
+                baseImage, columns, rows, options.SignatureGrid, phase, cancellationToken);
+        }
+
+        int[] assignment;
+        using (var phase = progress.Begin("Matching tiles", cellCount, "cells"))
+        {
+            assignment = Assign(cellSignatures, library, columns, rows, options, phase, cancellationToken);
+        }
 
         cancellationToken.ThrowIfCancellationRequested();
 
-        var mosaic = Render(assignment, library, columns, rows, options.TileSize);
+        Image<Rgba32> mosaic;
+        using (var phase = progress.Begin("Rendering mosaic", cellCount, "tiles"))
+        {
+            mosaic = Render(assignment, library, columns, rows, options.TileSize, phase);
+        }
+
         try
         {
             if (options.ColorAdjustStrength > 0d)
             {
-                ApplyColorAdjust(mosaic, baseAtOutputScale, (float)options.ColorAdjustStrength);
+                using var phase = progress.Begin("Colour matching", mosaic.Height, "rows");
+                ApplyColorAdjust(mosaic, baseAtOutputScale, (float)options.ColorAdjustStrength, phase);
             }
 
-            var quality = Measure(mosaic, baseImage, columns, rows, options.SignatureGrid, assignment);
+            MosaicQuality quality;
+            using (var phase = progress.Begin("Scoring likeness", cellCount * 2, "cells"))
+            {
+                quality = Measure(
+                    mosaic, baseImage, columns, rows, options.SignatureGrid, assignment, phase, cancellationToken);
+            }
 
             logger.LogInformation(
                 "Mosaic built in {Elapsed:0.0}s — mean ΔE {Mean:0.00}, p95 ΔE {P95:0.00}, worst ΔE {Worst:0.00}, {Distinct} distinct tile(s).",
@@ -148,12 +187,18 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
     }
 
     private static ColorSignature[] ComputeCellSignatures(
-        Image<Rgba32> baseImage, int columns, int rows, int signatureGrid)
+        Image<Rgba32> baseImage,
+        int columns,
+        int rows,
+        int signatureGrid,
+        IProgressPhase? phase = null,
+        CancellationToken cancellationToken = default)
     {
         var signatures = new ColorSignature[columns * rows];
 
         for (var row = 0; row < rows; row++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             // Boundaries come from scaled integer division so cells tile the base image exactly and
             // no row or column of source pixels is dropped or double-counted.
             var top = (int)((long)row * baseImage.Height / rows);
@@ -177,6 +222,10 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                     new Rectangle(left, top, right - left, bottom - top),
                     signatureGrid);
             }
+
+            // Reported per row rather than per cell: a row is a coarse enough unit to keep the
+            // counter cheap, and fine enough to animate on any realistic grid.
+            phase?.Advance(columns);
         }
 
         return signatures;
@@ -191,7 +240,9 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
         TileLibrary library,
         int columns,
         int rows,
-        MosaicOptions options)
+        MosaicOptions options,
+        IProgressPhase? phase = null,
+        CancellationToken cancellationToken = default)
     {
         var tiles = library.Tiles;
         var assignment = new int[columns * rows];
@@ -202,6 +253,7 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
 
         for (var row = 0; row < rows; row++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             for (var col = 0; col < columns; col++)
             {
                 var cellIndex = row * columns + col;
@@ -248,6 +300,8 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                 assignment[cellIndex] = bestTile;
                 tiles[bestTile].UseCount++;
             }
+
+            phase?.Advance(columns);
         }
 
         return assignment;
@@ -278,7 +332,12 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
     }
 
     private static Image<Rgba32> Render(
-        int[] assignment, TileLibrary library, int columns, int rows, int tileSize)
+        int[] assignment,
+        TileLibrary library,
+        int columns,
+        int rows,
+        int tileSize,
+        IProgressPhase? phase = null)
     {
         var mosaic = new Image<Rgba32>(columns * tileSize, rows * tileSize);
         try
@@ -292,6 +351,8 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                         var tile = library.Tiles[assignment[row * columns + col]];
                         ctx.DrawImage(tile.Pixels, new Point(col * tileSize, row * tileSize), 1f);
                     }
+
+                    phase?.Advance(columns);
                 }
             });
 
@@ -309,7 +370,11 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
     /// Because the target varies per pixel, tile texture survives even at high strength — at
     /// strength 1 the result is exactly the base image, at 0 the tiles are untouched.
     /// </summary>
-    private static void ApplyColorAdjust(Image<Rgba32> mosaic, Image<Rgba32> baseAtOutputScale, float strength)
+    private static void ApplyColorAdjust(
+        Image<Rgba32> mosaic,
+        Image<Rgba32> baseAtOutputScale,
+        float strength,
+        IProgressPhase? phase = null)
     {
         Debug.Assert(mosaic.Size == baseAtOutputScale.Size, "Colour-adjust target must match the mosaic size.");
 
@@ -333,6 +398,8 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
                         ColorMath.LinearToSrgb(ColorMath.SrgbToLinear(m.B) * keep + ColorMath.SrgbToLinear(t.B) * strength),
                         byte.MaxValue);
                 }
+
+                phase?.Advance();
             }
         });
     }
@@ -348,10 +415,13 @@ public sealed class MosaicBuilder(ILogger<MosaicBuilder> logger)
         int columns,
         int rows,
         int signatureGrid,
-        int[] assignment)
+        int[] assignment,
+        IProgressPhase? phase = null,
+        CancellationToken cancellationToken = default)
     {
-        var baseCells = ComputeCellSignatures(baseImage, columns, rows, signatureGrid);
-        var mosaicCells = ComputeCellSignatures(mosaic, columns, rows, signatureGrid);
+        // Two passes over the grid, which is why the phase total is 2x the cell count.
+        var baseCells = ComputeCellSignatures(baseImage, columns, rows, signatureGrid, phase, cancellationToken);
+        var mosaicCells = ComputeCellSignatures(mosaic, columns, rows, signatureGrid, phase, cancellationToken);
 
         var deltas = new double[baseCells.Length];
         var total = 0d;

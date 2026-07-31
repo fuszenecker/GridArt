@@ -1,3 +1,4 @@
+using gridart.Progress;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
@@ -53,14 +54,32 @@ public sealed class TileLibrary : IDisposable
         bool recursive,
         ILogger logger,
         CancellationToken cancellationToken,
-        TileCache? cache = null)
+        TileCache? cache = null,
+        IProgressReporter? progress = null)
     {
-        var searchOption = recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
-        var candidates = Directory
-            .EnumerateFiles(folder, "*", searchOption)
-            .Where(path => SupportedExtensions.Contains(Path.GetExtension(path)))
-            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
+        progress ??= NullProgressReporter.Instance;
+
+        // Scanning a large or networked folder tree is itself slow enough to need feedback, and the
+        // total is unknown until it finishes.
+        string[] candidates;
+        using (var scan = progress.Begin("Scanning folder", unit: "files"))
+        {
+            var searchOption = recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+            var found = new List<string>();
+
+            foreach (var path in Directory.EnumerateFiles(folder, "*", searchOption))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (SupportedExtensions.Contains(Path.GetExtension(path)))
+                {
+                    found.Add(path);
+                    scan.Advance();
+                }
+            }
+
+            candidates = found.OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray();
+        }
 
         if (candidates.Length == 0)
         {
@@ -69,13 +88,15 @@ public sealed class TileLibrary : IDisposable
                 string.Join(", ", SupportedExtensions.Order(StringComparer.OrdinalIgnoreCase)));
         }
 
-        logger.LogInformation("Loading {Count} candidate tile images from {Folder}.", candidates.Length, folder);
+        logger.LogDebug("Loading {Count} candidate tile images from {Folder}.", candidates.Length, folder);
 
         // Decoding dominates load time and is CPU-bound, so fan out across cores. The bag keeps the
         // parallel writes lock-free; results are re-sorted afterwards for deterministic output.
         var loaded = new System.Collections.Concurrent.ConcurrentBag<Tile>();
         var failures = 0;
         var cacheHits = 0;
+
+        using var loadPhase = progress.Begin("Loading tiles", candidates.Length, "tiles");
 
         await Parallel.ForEachAsync(
             candidates,
@@ -132,9 +153,31 @@ public sealed class TileLibrary : IDisposable
                     Interlocked.Increment(ref failures);
                     logger.LogWarning("Skipping {Path}: {Reason}", path, ex.Message);
                 }
+                finally
+                {
+                    loadPhase.Advance();
+                }
             });
 
-        cache?.Save(loaded.Select(t => t.Path).ToArray());
+        loadPhase.Dispose();
+
+        if (cache is not null)
+        {
+            var decoded = loaded.Count - cacheHits;
+
+            // Nothing new to store and nothing to prune is the common warm-cache case; skip the phase
+            // entirely rather than announce a no-op.
+            if (decoded > 0 || cache.LoadedCount != loaded.Count)
+            {
+                using var savePhase = progress.Begin("Saving tile cache", unit: "entries");
+                cache.Save(loaded.Select(t => t.Path).ToArray());
+                savePhase.Advance(loaded.Count);
+            }
+            else
+            {
+                cache.Save(loaded.Select(t => t.Path).ToArray());
+            }
+        }
 
         var tiles = loaded.OrderBy(t => t.Path, StringComparer.OrdinalIgnoreCase).ToList();
 
